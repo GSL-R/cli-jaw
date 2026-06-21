@@ -350,7 +350,7 @@ test('AGY-RT-014: AGY quiet completion is anchored on the final transcript plann
     }), null);
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     assert.match(spawnSrc, /getAgyQuietCompletionDelayMs\(ctx\)/);
-    assert.match(spawnSrc, /onActivity:\s*\(\)\s*=>\s*\{\s*scheduleAgyQuietCompletion\(\);\s*\}/);
+    assert.match(spawnSrc, /onActivity:\s*\(\)\s*=>\s*\{[\s\S]*?markProgress\(\);[\s\S]*?scheduleAgyQuietCompletion\(\);\s*\}/);
 });
 
 test('AGY-RT-015: transcript watcher drives the final planner flag and growth activity', () => {
@@ -364,6 +364,9 @@ test('AGY-RT-015: transcript watcher drives the final planner flag and growth ac
     assert.match(watcherSrc, /delta\.offset > previousOffset/);
     assert.match(watcherSrc, /agyTranscriptActive = true/);
     assert.match(watcherSrc, /options\.onActivity\?\.\(\)/);
+    assert.match(watcherSrc, /JAW_AGY_CHECKPOINT_STALL_MS/);
+    assert.match(watcherSrc, /rowType === 'CHECKPOINT'/);
+    assert.match(watcherSrc, /options\.onCheckpointStall\?\.\(/);
     // Fast-resume regression: a USER_INPUT row must clear a stale final-planner flag set
     // by the previous turn's row inside the lookback buffer.
     assert.match(watcherSrc, /rowType === 'USER_INPUT'/);

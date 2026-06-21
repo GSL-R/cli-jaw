@@ -2078,7 +2078,20 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 scheduleAgyQuietCompletion();
             },
             onActivity: () => {
+                ctx.stallWatchdog?.markProgress();
                 scheduleAgyQuietCompletion();
+            },
+            onCheckpointStall: (stalledMs, conversationId) => {
+                const reason = `agy checkpoint stalled for ${Math.round(stalledMs / 1000)}s${conversationId ? ` (conversation ${conversationId})` : ''}`;
+                console.log(`[jaw:watchdog] killing ${agentLabel} — ${reason}`);
+                ctx.stallReason = reason;
+                ctx.stallWatchdog?.stop();
+                if (child.pid) {
+                    killProcessTree(child.pid, 'SIGTERM');
+                    setTimeout(() => {
+                        try { killProcessTree(child.pid!, 'SIGKILL'); } catch { /* already dead */ }
+                    }, 5_000);
+                }
             },
         });
     }
