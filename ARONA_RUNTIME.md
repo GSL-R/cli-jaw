@@ -17,6 +17,10 @@ The current `arona-runtime` branch is based on cli-jaw 2.1.5 and carries:
 1. The upstream preview fix for issue #245, cherry-picked as a source commit.
 2. Antigravity transcript progress and bounded checkpoint-stall handling.
 3. Telegram-supported HTML preservation with unsafe raw tags escaped.
+4. Honest AGY quota rendering when the provider exposes binary availability
+   instead of a precise remaining fraction.
+5. Explicit AGY transcript provider-error propagation from upstream issue
+   #246, while preserving successful recovery after transient errors.
 
 Runtime identity prompts, diaries, credentials, local paths, and private
 automation are intentionally excluded from this fork.
@@ -54,4 +58,3 @@ git rebase master
 During the rebase, drop a local patch when upstream provides an equivalent
 tested implementation. Never resolve a conflict by restoring an old generated
 `dist/` file over newer source.
-
