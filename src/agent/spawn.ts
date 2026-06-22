@@ -919,6 +919,9 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     const isResume = empSid
         ? true
         : (providerSupportsResume && !opts._skipResume && !forceNew && !!bucketSessionId && canResumeBucketSession);
+    // Provider-native resume and cli-jaw conversation continuity are different.
+    // AGY starts a new process each turn but keeps the same DB-backed bucket.
+    const isFreshConversation = !bucketSessionId || forceNew || !canResumeBucketSession;
     const runtimeStatusMeta = buildAiERuntimeStatusMeta(cli, effectiveProvider, runtimeModel);
 
     // ─── Bootstrap compact 1-shot injection (Phase 52: bucket-aware) ───
@@ -977,7 +980,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
 
     const sysPrompt = customSysPrompt !== undefined
         ? customSysPrompt
-        : getSystemPrompt(stripUndefined({ currentPrompt: promptForSnapshot, forDisk: false, memorySnapshot: memorySnapshotForPrompt, activeCli: cli }));
+        : getSystemPrompt(stripUndefined({ currentPrompt: promptForSnapshot, forDisk: false, memorySnapshot: memorySnapshotForPrompt, activeCli: cli, freshSession: isFreshConversation }));
 
     // ─── User prompt wrapper (boss main only) ───
     // #99: compact timestamp + project root (moved from builder.ts system prompt → user prompt)
