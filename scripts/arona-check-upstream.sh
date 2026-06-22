@@ -11,6 +11,15 @@ fi
 
 git fetch upstream --prune --tags --quiet
 
+if git rev-parse --verify upstream/main >/dev/null 2>&1; then
+    stable_ref="upstream/main"
+elif git rev-parse --verify upstream/master >/dev/null 2>&1; then
+    stable_ref="upstream/master"
+else
+    echo "Missing upstream stable branch (main or master)." >&2
+    exit 1
+fi
+
 installed="$(npm list -g cli-jaw --depth=0 --json 2>/dev/null | node -e '
 let input = "";
 process.stdin.on("data", chunk => input += chunk);
@@ -30,7 +39,7 @@ timeout 20s npm view cli-jaw dist-tags --json 2>/dev/null || echo "npm registry 
 
 echo
 echo "== Upstream branch heads =="
-for ref in upstream/master upstream/dev upstream/preview; do
+for ref in "$stable_ref" upstream/dev upstream/preview; do
     if git rev-parse --verify "$ref" >/dev/null 2>&1; then
         git show -s --format="$ref%n  %H%n  %cI%n  %s" "$ref"
     fi
@@ -50,13 +59,13 @@ git for-each-ref \
     | grep -v 'upstream/HEAD' || true
 
 echo
-echo "== Unreleased preview commits after stable master =="
-git log --oneline --decorate --no-merges upstream/master..upstream/preview -20
+echo "== Unreleased preview commits after stable branch =="
+git log --oneline --decorate --no-merges "$stable_ref"..upstream/preview -20
 
 echo
 echo "== Preview change summary =="
-git diff --shortstat upstream/master...upstream/preview
+git diff --shortstat "$stable_ref"...upstream/preview
 
 echo
-echo "== Local runtime commits after stable master =="
-git log --oneline --decorate upstream/master..arona-runtime 2>/dev/null || true
+echo "== Local runtime commits after stable branch =="
+git log --oneline --decorate "$stable_ref"..arona-runtime 2>/dev/null || true
