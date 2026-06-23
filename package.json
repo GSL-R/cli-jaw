@@ -86,6 +86,7 @@
     "test:fresh-install": "tsx scripts/fresh-install-smoke.ts",
     "build": "bash scripts/atomic-build.sh",
     "postbuild": "node scripts/link-current-nvm-bin.cjs",
+    "arona:runtime-profile": "bash scripts/arona-runtime-profile.sh",
     "build:frontend": "vite build --config vite.config.ts",
     "qa:manager-frontend": "npm run build:frontend && npm run typecheck:frontend",
     "dev:frontend": "vite --config vite.config.ts",

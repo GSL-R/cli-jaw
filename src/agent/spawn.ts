@@ -312,6 +312,19 @@ export const {
     getQueuedMessageSnapshotForScope,
 } = queueCtrl;
 
+function drainHeartbeatPendingSoon(): void {
+    queueMicrotask(() => {
+        import('../memory/heartbeat.js')
+            .then(mod => mod.drainPending())
+            .catch(err => console.warn('[heartbeat] drain after main turn failed:', (err as Error).message));
+    });
+}
+
+function drainQueuesAfterMain(): void {
+    processQueue();
+    drainHeartbeatPendingSoon();
+}
+
 let mainSpawnStarting = false;
 let cancelPendingMainSpawn: ((reason: string) => void) | null = null;
 let steerInProgress = false;
@@ -718,6 +731,34 @@ function cleanupEmployeeTmpDir(cwd: string, workingDir: string, label: string) {
     }
 }
 
+const AGY_INLINE_PROMPT_BYTE_LIMIT = 12000;
+const AGY_PROMPT_FALLBACK_TEXT = 'Continue using the workspace instructions and proceed with the task.';
+
+function prepareAgyPromptWorkspace(bundleText: string, currentPrompt: string, workingDir: string, label: string): { cwd: string; prompt: string } {
+    const tmpDir = join(os.tmpdir(), `jaw-agy-prompt-${label}-${Date.now()}-${crypto.randomUUID()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const promptBundle = [
+        '# cli-jaw AGY prompt bundle',
+        '',
+        bundleText,
+        '',
+        '---',
+        '',
+        `Project root: ${workingDir}`,
+    ].join('\n');
+
+    for (const name of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', 'CONTEXT.md']) {
+        fs.writeFileSync(join(tmpDir, name), promptBundle);
+    }
+
+    console.log(`[jaw:${label}] AGY prompt spilled to workspace files → ${tmpDir}`);
+    const promptForArg = Buffer.byteLength(currentPrompt, 'utf8') <= AGY_INLINE_PROMPT_BYTE_LIMIT
+        ? currentPrompt
+        : AGY_PROMPT_FALLBACK_TEXT;
+    return { cwd: tmpDir, prompt: promptForArg };
+}
+
 export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     const { forceNew = false, agentId, sysPrompt: customSysPrompt, memorySnapshot } = opts;
     const origin = opts.origin || 'web';
@@ -725,6 +766,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     const mainManaged = !forceNew && !opts.agentId && !empSid && !opts.internal;
     const gateEligibleMain = mainManaged && !opts.agentId && !opts.internal && !opts._isFallback && !opts._isSmokeContinuation && !opts._isGoalContinuation;
     const isEmployee = !mainManaged;
+    const agentLabel = agentId || 'main';
     const empTag = isEmployee ? { isEmployee: true } : {};
 
     if (gateEligibleMain && !opts._settingsGateWaited && isRuntimeSettingsMutationInFlight()) {
@@ -751,7 +793,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             } finally {
                 if (cancelPendingMainSpawn === cancelThisSpawn) cancelPendingMainSpawn = null;
                 mainSpawnStarting = false;
-                processQueue();
+                drainQueuesAfterMain();
             }
         })();
         return { child: null, promise };
@@ -852,7 +894,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 mainSpawnStarting = false;
                 jawRuntime.setLiveScope(undefined);
                 resolve!({ text: finalText, code: result.code });
-                processQueue();
+                drainQueuesAfterMain();
             }
         };
         // jawRuntime.prompt is designed never to reject, but guard defensively so a
@@ -1064,6 +1106,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     const agyPrintTimeout = cli === 'agy'
         ? formatAgyPrintTimeout(resolvedAgyPrintTimeoutMs)
         : undefined;
+    let spawnCwd = settings["workingDir"];
     const argOptions = {
         fastMode: cfg.fastMode,
         sysPrompt,
@@ -1074,6 +1117,12 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ...(agyLogFile ? { agyLogFile } : {}),
         ...(agyPrintTimeout ? { agyPrintTimeout } : {}),
     };
+
+    if (cli === 'agy' && Buffer.byteLength(promptForArgs, 'utf8') > AGY_INLINE_PROMPT_BYTE_LIMIT) {
+        const spilled = prepareAgyPromptWorkspace(promptForArgs, prompt, settings["workingDir"] || os.homedir(), agentLabel);
+        promptForArgs = spilled.prompt;
+        spawnCwd = spilled.cwd;
+    }
     let args;
     if (isResume) {
         const sid = resumeSessionId || '';
@@ -1083,15 +1132,12 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         args = buildArgs(cli, runtimeModel, effort, promptForArgs, sysPrompt, permissions, argOptions);
     }
 
-    const agentLabel = agentId || 'main';
     const traceAudience: 'public' | 'internal' = (opts.internal || isEmployee) ? 'internal' : 'public';
     const parentLiveScopeForChild = !opts.internal && isEmployee ? liveScope : null;
 
     // ─── Universal employee isolation ────────────────────
     // All CLIs auto-read AGENTS.md/CLAUDE.md/GEMINI.md from cwd.
     // Employees must NOT see the Boss's instruction files.
-    let spawnCwd = settings["workingDir"];
-
     if (opts.agentId && (customSysPrompt || sysPrompt)) {
         const empPrompt = customSysPrompt || sysPrompt;
         const empPromptWithWorkspace = opts.workspaceContext
@@ -1130,7 +1176,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         if (mainManaged) clearLiveRun(liveScope);
         broadcast('agent_done', { text: `❌ ${msg}`, error: true, origin, ...empTag }, isEmployee ? 'internal' : 'public');
         resolve!({ text: '', code: 127 });
-        if (mainManaged) processQueue();
+        if (mainManaged) drainQueuesAfterMain();
         cleanupEmployeeTmpDir(spawnCwd, settings["workingDir"], agentLabel);
         return { child: null, promise: resultPromise };
     }
@@ -1199,7 +1245,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             }
             broadcast('agent_done', { text: `❌ ${msg}`, error: true, origin, ...empTag }, isEmployee ? 'internal' : 'public');
             resolve!({ text: '', code: 1 });
-            if (mainManaged) processQueue();
+            if (mainManaged) drainQueuesAfterMain();
         });
 
         if (mainManaged && !opts.internal && !opts._skipInsert) {
@@ -1663,7 +1709,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             }
             broadcast('agent_done', { text: `❌ ${msg}`, error: true, origin, ...empTag }, isEmployee ? 'internal' : 'public');
             resolve!({ text: '', code: 1 });
-            if (mainManaged) processQueue();
+            if (mainManaged) drainQueuesAfterMain();
         });
 
         if (mainManaged && !opts.internal && !opts._skipInsert) {
@@ -1964,7 +2010,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         }
         broadcast('agent_done', { text: `❌ ${msg}`, error: true, origin, ...empTag }, isEmployee ? 'internal' : 'public');
         resolve!({ text: '', code: 127 });
-        if (mainManaged) processQueue();
+        if (mainManaged) drainQueuesAfterMain();
     });
 
     if (mainManaged && !opts.internal && !opts._skipInsert) {
