@@ -15,11 +15,42 @@ test('root CLI registers worker command', () => {
 });
 
 test('worker command queries status and watch progress endpoints', () => {
-    assert.match(workerSrc, /worker status \[agent\]/);
-    assert.match(workerSrc, /worker watch \[agent\]/);
+    assert.match(workerSrc, /worker status \[agent\|runId\] \[--recent N\] \[--json\]/);
+    assert.match(workerSrc, /worker watch \[agent\|runId\] \[--json\]/);
     assert.match(workerSrc, /\/api\/orchestrate\/worker-progress/);
     assert.match(workerSrc, /\/api\/orchestrate\/worker-progress\/\$\{encodeURIComponent\(agentId\)\}/);
     assert.match(workerSrc, /setTimeout|sleep\(2_000\)/);
+});
+
+test('worker command exposes explicit raw output read by runId only', () => {
+    assert.match(workerSrc, /worker read <runId> \[--offset N --limit N\] \[--json\]/);
+    assert.match(workerSrc, /worker read <runId> \[--tail N\]/);
+    assert.match(workerSrc, /function requireRunId/);
+    assert.match(workerSrc, /worker read requires an explicit runId/);
+    assert.match(workerSrc, /\/api\/orchestrate\/worker-runs\/\$\{encodeURIComponent\(runId\)\}\/output/);
+    assert.match(workerSrc, /\/api\/orchestrate\/worker-runs\/\$\{encodeURIComponent\(runId\)\}/);
+    assert.match(workerSrc, /const offset = Math\.max\(0, run\.outputBytes - tail\)/);
+    assert.match(workerSrc, /More output available: cli-jaw worker read/);
+});
+
+test('worker command keeps status/watch on safe-summary surfaces', () => {
+    const readIdx = workerSrc.indexOf("if (command === 'read')");
+    const statusIdx = workerSrc.indexOf("if (command === 'status')");
+    assert.ok(readIdx >= 0 && statusIdx > readIdx, 'read branch should be isolated before safe status/watch flow');
+    const safeStatusWatchBlock = workerSrc.slice(statusIdx);
+    assert.doesNotMatch(safeStatusWatchBlock, /worker-runs\/\$\{encodeURIComponent\(runId\)\}\/output/);
+    assert.match(workerSrc, /fetchRunRecords\(\)/);
+    assert.match(workerSrc, /numericFlag\('--recent'\)/);
+});
+
+test('worker watch json emits a parseable safe progress snapshot', () => {
+    const watchJsonIdx = workerSrc.indexOf('if (json) {');
+    assert.ok(watchJsonIdx >= 0, 'watch branch should handle --json explicitly');
+    const watchJsonBlock = workerSrc.slice(watchJsonIdx, workerSrc.indexOf('const printed = new Set<string>()', watchJsonIdx));
+    assert.match(watchJsonBlock, /latest = await fetchProgress\(agentId\)/);
+    assert.match(watchJsonBlock, /hasCurrentRun\(latest\)/);
+    assert.match(watchJsonBlock, /JSON\.stringify\(latest, null, 2\)/);
+    assert.doesNotMatch(watchJsonBlock, /printNewTools|formatToolLine|console\.log\(formatToolLine/);
 });
 
 test('worker command prints lifecycle attention from progress snapshots', () => {
@@ -30,6 +61,13 @@ test('worker command prints lifecycle attention from progress snapshots', () => 
     assert.match(workerSrc, /console\.log\(`attention:/);
 });
 
+test('worker command prints run identity from progress snapshots', () => {
+    assert.match(workerSrc, /runId\?: string/);
+    assert.match(workerSrc, /snapshot\.runId/);
+    assert.match(workerSrc, /console\.log\(`runId:/);
+    assert.match(workerSrc, /console\.log\(`agentId:/);
+});
+
 test('worker command resolves display names through employees API', () => {
     assert.match(workerSrc, /unwrapEmployeeSummaries/);
     assert.match(workerSrc, /\/api\/employees/);
@@ -37,7 +75,7 @@ test('worker command resolves display names through employees API', () => {
 });
 
 test('structure commands document worker progress and employee sessions-reset surfaces', () => {
-    assert.match(commandsDoc, /`worker`\s*\|\s*`bin\/commands\/worker\.ts`\s*\|[^|\n]*status \[agent\][^|\n]*watch \[agent\]/);
+    assert.match(commandsDoc, /`worker`\s*\|\s*`bin\/commands\/worker\.ts`\s*\|[^|\n]*status \[agent\\\|runId\][^|\n]*watch \[agent\\\|runId\]/);
     assert.match(commandsDoc, /snapshot\.workers[^)\n]*running-only/);
     assert.match(commandsDoc, /`employee`\s*\|\s*`bin\/commands\/employee\.ts`\s*\|[^|\n]*sessions-reset \[--port 3457\]/);
 });

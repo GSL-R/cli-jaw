@@ -1,6 +1,7 @@
 // ─── Worker Registry ────────────────────────────────
 // In-memory registry tracking worker ownership and result handoff.
 
+import { randomUUID } from 'node:crypto';
 import { stripUndefined } from '../core/strip-undefined.js';
 import type { SanitizedToolLogEntry } from '../shared/tool-log-sanitize.js';
 import {
@@ -10,9 +11,16 @@ import {
     type WorkerProgressRun,
     type WorkerProgressSnapshot,
 } from './worker-progress.js';
+import {
+    completeWorkerRun,
+    createWorkerRunRecord,
+    recordWorkerRunAttention,
+    recordWorkerRunProgress,
+} from './worker-run-store.js';
 
 const workers = new Map<string, WorkerSlot>();
 const previousRuns = new Map<string, WorkerProgressRun>();
+const previousRunIdsByAgentId = new Map<string, string[]>();
 
 // Replay metadata captured when Boss dispatches the worker. Used by
 // drainPendingReplays so that when a disconnected employee's result is later
@@ -27,6 +35,7 @@ export interface WorkerReplayMeta {
 }
 
 export interface WorkerSlot {
+    runId: string;
     agentId: string;          // same key used in spawn.ts activeProcesses
     employeeId: string;
     employeeName: string;
@@ -65,12 +74,17 @@ export class WorkerBusyError extends Error {
 
 export interface WorkerEmployeeRef { id: string; name?: string }
 
+function createWorkerRunId(agentId: string): string {
+    return `wr_${agentId}_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
+}
+
 export function claimWorker(emp: WorkerEmployeeRef, task: string, replayMeta?: WorkerReplayMeta): WorkerSlot {
     const existing = workers.get(emp.id);
     if (existing && existing.state === 'running') {
         throw new WorkerBusyError(existing);
     }
     const slot: WorkerSlot = stripUndefined({
+        runId: createWorkerRunId(emp.id),
         agentId: emp.id,
         employeeId: emp.id,
         employeeName: emp.name || emp.id,
@@ -90,11 +104,18 @@ export function claimWorker(emp: WorkerEmployeeRef, task: string, replayMeta?: W
         replayMeta: replayMeta && Object.keys(replayMeta).length ? { ...replayMeta } : undefined,
     });
     workers.set(emp.id, slot);
+    createWorkerRunRecord({
+        runId: slot.runId,
+        agentId: slot.agentId,
+        employeeName: slot.employeeName,
+        taskPreview: previewText(slot.task, 200) || '',
+        startedAt: slot.startedAt,
+    });
     return slot;
 }
 
 export function getWorkerSlot(agentId: string): WorkerSlot | undefined {
-    return workers.get(agentId);
+    return workers.get(agentId) || [...workers.values()].find(slot => slot.runId === agentId);
 }
 
 export function updateWorkerPhase(agentId: string, phase: string, phaseLabel: string): void {
@@ -105,9 +126,12 @@ export function updateWorkerPhase(agentId: string, phase: string, phaseLabel: st
 }
 
 function toProgressRun(slot: WorkerSlot): WorkerProgressRun {
+    const now = Date.now();
     const resultPreview = previewText(slot.result, 240);
     const attention = progressAttention(slot);
+    const endAt = slot.completedAt ?? now;
     return {
+        runId: slot.runId,
         agentId: slot.agentId,
         employeeName: slot.employeeName,
         state: slot.state,
@@ -117,6 +141,8 @@ function toProgressRun(slot: WorkerSlot): WorkerProgressRun {
         startedAt: slot.startedAt,
         completedAt: slot.completedAt,
         progressUpdatedAt: slot.progressUpdatedAt,
+        elapsedMs: Math.max(0, endAt - slot.startedAt),
+        lastUpdateAgeMs: slot.progressUpdatedAt ? Math.max(0, now - slot.progressUpdatedAt) : null,
         ...(resultPreview ? { resultPreview } : {}),
         ...(attention ? { attention } : {}),
         tools: slot.tools,
@@ -143,6 +169,7 @@ function setWorkerAttention(agentId: string, attention: WorkerProgressAttention 
     if (!slot) return;
     slot.attention = attention;
     slot.progressUpdatedAt = Date.now();
+    recordWorkerRunAttention(slot.runId, attention);
 }
 
 export function markWorkerStalled(agentId: string): void {
@@ -183,12 +210,36 @@ const PREVIOUS_RUNS_MAX = 100;
 
 function rememberCompletedRun(slot: WorkerSlot): void {
     if (slot.state === 'running') return;
-    previousRuns.set(slot.agentId, toProgressRun(slot));
+    previousRuns.set(slot.runId, toProgressRun(slot));
+    const ids = previousRunIdsByAgentId.get(slot.agentId) || [];
+    if (!ids.includes(slot.runId)) ids.push(slot.runId);
+    previousRunIdsByAgentId.set(slot.agentId, ids);
     while (previousRuns.size > PREVIOUS_RUNS_MAX) {
         const oldest = previousRuns.keys().next().value;
         if (!oldest) break;
+        const oldestRun = previousRuns.get(oldest);
         previousRuns.delete(oldest);
+        if (oldestRun) {
+            const agentRunIds = previousRunIdsByAgentId.get(oldestRun.agentId) || [];
+            const filtered = agentRunIds.filter(id => id !== oldest);
+            if (filtered.length > 0) previousRunIdsByAgentId.set(oldestRun.agentId, filtered);
+            else previousRunIdsByAgentId.delete(oldestRun.agentId);
+        }
     }
+}
+
+function latestPreviousRunForAgent(agentId: string): WorkerProgressRun | null {
+    const ids = previousRunIdsByAgentId.get(agentId) || [];
+    for (let index = ids.length - 1; index >= 0; index--) {
+        const run = previousRuns.get(ids[index]!);
+        if (run) return run;
+    }
+    return null;
+}
+
+function previousRunsForAgent(agentId: string): WorkerProgressRun[] {
+    const ids = previousRunIdsByAgentId.get(agentId) || [];
+    return ids.map(id => previousRuns.get(id)).filter((run): run is WorkerProgressRun => Boolean(run));
 }
 
 export function setWorkerOrchestration(agentId: string, orchestration: Record<string, unknown>): void {
@@ -203,6 +254,7 @@ export function updateWorkerTools(agentId: string, tools: unknown[]): void {
     if (slot.attention?.kind === 'stalled') slot.attention = null;
     slot.tools = sanitizeWorkerProgressTools(tools);
     slot.progressUpdatedAt = Date.now();
+    recordWorkerRunProgress(slot.runId, slot.tools);
 }
 
 export function finishWorker(agentId: string, result: string, tools: unknown[] = []): void {
@@ -212,6 +264,7 @@ export function finishWorker(agentId: string, result: string, tools: unknown[] =
     slot.completedAt = Date.now();
     slot.result = result;
     if (tools.length > 0) updateWorkerTools(agentId, tools);
+    completeWorkerRun(slot.runId, 'done', result);
     rememberCompletedRun(slot);
     slot.pendingReplay = true;
 }
@@ -222,6 +275,7 @@ export function failWorker(agentId: string, result: string): void {
     slot.state = 'failed';
     slot.completedAt = Date.now();
     slot.result = result;
+    completeWorkerRun(slot.runId, 'failed', result);
     rememberCompletedRun(slot);
     slot.pendingReplay = false;  // Failed workers don't need replay — no result to feed back to Boss
 }
@@ -232,28 +286,53 @@ export function cancelWorker(agentId: string): void {
     slot.state = 'cancelled';
     slot.completedAt = Date.now();
     slot.pendingReplay = false;
+    completeWorkerRun(slot.runId, 'cancelled', slot.result || '');
     rememberCompletedRun(slot);
     workers.delete(agentId);
 }
 
 export function getWorkerProgressSnapshot(agentId: string): WorkerProgressSnapshot | null {
     const slot = workers.get(agentId);
-    const previous = previousRuns.get(agentId) || null;
-    if (!slot && !previous) return null;
+    const runSlot = slot || [...workers.values()].find(value => value.runId === agentId);
+    const previousByRunId = previousRuns.get(agentId) || null;
+    const previousByAgent = latestPreviousRunForAgent(agentId);
+    const previous = previousByRunId || (runSlot ? latestPreviousRunForAgent(runSlot.agentId) : previousByAgent);
+    const currentRun = runSlot?.state === 'running' ? toProgressRun(runSlot) : null;
+    const previousRun = runSlot && runSlot.state !== 'running' ? toProgressRun(runSlot) : previous;
+    if (!runSlot && !previousRun) return null;
     return {
-        agentId,
-        employeeName: slot?.employeeName || previous?.employeeName || agentId,
-        current: slot?.state === 'running' ? toProgressRun(slot) : null,
-        previous: slot && slot.state !== 'running' ? toProgressRun(slot) : previous,
+        runId: currentRun?.runId || previousRun?.runId || null,
+        agentId: runSlot?.agentId || previousRun?.agentId || agentId,
+        employeeName: runSlot?.employeeName || previousRun?.employeeName || agentId,
+        current: currentRun,
+        previous: previousRun,
+        ...(previousRunsForAgent(runSlot?.agentId || previousRun?.agentId || agentId).length > 1
+            ? { previousRuns: previousRunsForAgent(runSlot?.agentId || previousRun?.agentId || agentId) }
+            : {}),
         generatedAt: Date.now(),
     };
 }
 
 export function listWorkerProgressSnapshots(): WorkerProgressSnapshot[] {
-    const ids = new Set([...workers.keys(), ...previousRuns.keys()]);
-    return [...ids]
+    const snapshots = [...workers.keys()]
         .map(getWorkerProgressSnapshot)
         .filter((value): value is WorkerProgressSnapshot => Boolean(value));
+    const seenRunIds = new Set(snapshots.flatMap(snapshot => [
+        snapshot.current?.runId,
+        snapshot.previous?.runId,
+    ]).filter((value): value is string => Boolean(value)));
+    for (const run of previousRuns.values()) {
+        if (seenRunIds.has(run.runId)) continue;
+        snapshots.push({
+            runId: run.runId,
+            agentId: run.agentId,
+            employeeName: run.employeeName,
+            current: null,
+            previous: run,
+            generatedAt: Date.now(),
+        });
+    }
+    return snapshots;
 }
 
 export function getActiveWorkers(): WorkerSlot[] {
@@ -274,12 +353,15 @@ export function hasPendingWorkerReplays(): boolean {
     return false;
 }
 
-export function listPendingWorkerResults(): Array<{ agentId: string; text: string; tools?: SanitizedToolLogEntry[]; meta?: WorkerReplayMeta }> {
-    const results: Array<{ agentId: string; text: string; tools?: SanitizedToolLogEntry[]; meta?: WorkerReplayMeta }> = [];
+export function listPendingWorkerResults(): Array<{ agentId: string; runId: string; employeeName: string; taskPreview: string; text: string; tools?: SanitizedToolLogEntry[]; meta?: WorkerReplayMeta }> {
+    const results: Array<{ agentId: string; runId: string; employeeName: string; taskPreview: string; text: string; tools?: SanitizedToolLogEntry[]; meta?: WorkerReplayMeta }> = [];
     for (const slot of workers.values()) {
         if (slot.state === 'done' && slot.pendingReplay && !slot.replayClaimed && slot.result !== null) {
             results.push(stripUndefined({
                 agentId: slot.agentId,
+                runId: slot.runId,
+                employeeName: slot.employeeName,
+                taskPreview: previewText(slot.task, 200) || '',
                 text: slot.result,
                 tools: slot.tools.length > 0 ? slot.tools : undefined,
                 meta: slot.replayMeta,
@@ -319,6 +401,8 @@ export function releaseWorkerReplay(agentId: string): void {
             occurredAt: Date.now(),
             attempts: slot.replayAttempts,
         };
+        recordWorkerRunAttention(slot.runId, slot.attention);
+        completeWorkerRun(slot.runId, 'failed', slot.result || '');
         rememberCompletedRun(slot);
     }
 }
@@ -326,4 +410,5 @@ export function releaseWorkerReplay(agentId: string): void {
 export function clearAllWorkers(): void {
     workers.clear();
     previousRuns.clear();
+    previousRunIdsByAgentId.clear();
 }

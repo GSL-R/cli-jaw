@@ -13,7 +13,7 @@
 // The engine is loaded lazily by dynamic import so this module compiles before
 // the jwc package is linked (100 in flight). Resolution order:
 //   1. JWC_SDK_PATH env (absolute path to dist-node/sdk.js — dev/CI)
-//   2. "jawcode/sdk" package export (package dependency path)
+//   2. "jawcode/sdk" package export (separately installed package path)
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -44,11 +44,23 @@ interface EngineSdk {
 }
 
 let sdkPromise: Promise<EngineSdk> | null = null;
+const DEFAULT_JWC_SDK_SPEC = 'jawcode/sdk';
+const JWC_INSTALL_HINT =
+    'cli-jaw does not bundle JWC. Run jaw jwc install, set the printed JWC_SDK_PATH, and verify with jaw jwc doctor. For source builds, set JWC_SDK_PATH=/absolute/path/to/jawcode/packages/jwc/dist-node/sdk.js (for example, /Users/jun/Developer/new/700_projects/jawcode/packages/jwc/dist-node/sdk.js). Remove optional JWC dependencies with jaw jwc clean.';
+
+function formatSdkLoadError(spec: string, err: unknown): Error {
+    const detail = err instanceof Error ? err.message : String(err);
+    return new Error(`JWC SDK is not available from ${spec}. ${JWC_INSTALL_HINT} Original error: ${detail}`);
+}
+
 function loadSdk(): Promise<EngineSdk> {
     if (sdkPromise) return sdkPromise;
     const override = process.env['JWC_SDK_PATH'];
-    const spec = override && override.trim() ? override.trim() : 'jawcode/sdk';
-    sdkPromise = import(spec) as Promise<EngineSdk>;
+    const spec = override && override.trim() ? override.trim() : DEFAULT_JWC_SDK_SPEC;
+    sdkPromise = (import(spec) as Promise<EngineSdk>).catch(err => {
+        sdkPromise = null;
+        throw formatSdkLoadError(spec, err);
+    });
     return sdkPromise;
 }
 

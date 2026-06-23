@@ -118,6 +118,14 @@ SSE behavior:
 | `worker_stalled` | `{ agentId, employeeName, isEmployee: true }` | `orchestrator/distribute.ts`; worker stall; progress snapshot `attention.kind=stalled` |
 | `worker_disconnected` | `{ agentId, exitCode, isEmployee: true }` | `orchestrator/distribute.ts`; worker disconnect; progress snapshot `attention.kind=disconnected` |
 | `worker_timeout` | `{ agentId, employeeName, isEmployee: true }` | `orchestrator/distribute.ts`; worker timeout; progress snapshot `attention.kind=timeout` |
+| `worker_run_started` | `{ runId, agentId, employeeName, status, statusCategory, outputBytes, seq, taskPreview }` | `orchestrator/worker-run-store.ts`; durable run started safe event |
+| `worker_run_progress` | `{ runId, agentId, employeeName, status, statusCategory, outputBytes, seq, tools, toolCount }` | `orchestrator/worker-run-store.ts`; sanitized tool progress snapshot; no raw output |
+| `worker_run_attention` | `{ runId, agentId, employeeName, status, statusCategory, outputBytes, seq, attention }` | `orchestrator/worker-run-store.ts`; safe attention metadata |
+| `worker_run_done` / `worker_run_failed` / `worker_run_cancelled` | `{ runId, agentId, employeeName, status, statusCategory, outputBytes, seq, completedAt, safeSummary? }` | `orchestrator/worker-run-store.ts`; completion event; raw output path/content excluded |
+
+Worker run events, delayed replay notices, and batch dispatch summaries are safe metadata surfaces. They may carry bounded previews and recovery commands, but they do not embed raw employee stdout; raw worker output remains an explicit `/api/orchestrate/worker-runs/:runId/output` / `cli-jaw worker read <runId>` read path.
+
+`bgtask_update` frames stay on topic `bgtask` and expose `running[]` plus `changed`; both entries keep native bgtask `status` and add shared `statusCategory`. Worker runs and bgtasks do not share storage, but Manager can compare their status buckets without reimplementing per-surface mappings.
 
 ### Web client handling
 
@@ -128,6 +136,7 @@ SSE behavior:
 | Type | 현재 처리 경로 |
 | --- | --- |
 | `worker_stalled` / `worker_disconnected` / `worker_timeout` | `public/js/ws.ts`에서 disconnected/timeout/stalled handler로 처리하고, manager server는 worker-SSE bridge/cache로 별도 추적한다. 현재/이전 worker progress API는 UI hydration용 safe `attention` metadata도 제공한다 |
+| `worker_run_*` | safe SSE/replay와 `/api/orchestrate/worker-runs*` read API용 backend contract다. Manager Worker Runs 패널은 기존 frontend worker progress EventSource bridge로 이 이벤트를 refresh invalidation으로 소비하고, raw output은 명시 클릭 시 `/output` route로만 읽는다 |
 | `system_notice` | SSE public emit은 되지만 `public/js/ws.ts` 직접 분기는 없다 |
 | `agent:claude-e:*` | native helper lifecycle/status telemetry. 현재 Web UI 직접 분기는 없고, trace/internal listener와 외부 observer용이다 |
 

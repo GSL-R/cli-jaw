@@ -24,6 +24,13 @@ import {
     listWorkerProgressSnapshots,
     setWorkerOrchestration,
 } from '../orchestrator/worker-registry.js';
+import { previewText } from '../orchestrator/worker-progress.js';
+import {
+    getWorkerRunRecord,
+    listWorkerRunEvents,
+    listWorkerRunRecords,
+    readWorkerRunOutput,
+} from '../orchestrator/worker-run-store.js';
 import { findEmployee, runSingleAgent, validateParallelSafety } from '../orchestrator/distribute.js';
 import { getEmployees } from '../core/db.js';
 import { settings } from '../core/config.js';
@@ -406,6 +413,7 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
                     error: 'worker_busy',
                     existing: {
                         agentId: err.existing.agentId,
+                        runId: err.existing.runId,
                         employeeName: err.existing.employeeName,
                         task: err.existing.task.slice(0, 200),
                         startedAt: err.existing.startedAt,
@@ -514,7 +522,7 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
 
             try {
                 getSecurityAuditLog().append('dispatch_end', String(req.ip || 'local'), {
-                    agent: emp.name, agentId: slot.agentId, status: 'success',
+	                agent: emp.name, agentId: slot.agentId, status: 'success',
                 });
             } catch { /* non-fatal */ }
 
@@ -554,9 +562,10 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
             res.status(202).json({
                 ok: true,
                 state: 'running',
-                worker: {
-                    agentId: slot.agentId,
-                    employeeName: slot.employeeName,
+                    worker: {
+                        agentId: slot.agentId,
+                        runId: slot.runId,
+                        employeeName: slot.employeeName,
                     startedAt: slot.startedAt,
                 },
                 progress: getWorkerProgressSnapshot(slot.agentId),
@@ -638,7 +647,7 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
         validateParallelSafety(agentPhases);
         const parallelResolved = new Map(agentPhases.map((ap, i) => [i, ap.parallel]));
 
-        const runOne = async (entry: BatchEntry): Promise<{ agent: string; ok: boolean; text?: string; error?: string }> => {
+        const runOne = async (entry: BatchEntry): Promise<{ agent: string; ok: boolean; runId?: string; status?: string; preview?: string; recoveryCommand?: string; outputBytes?: number; error?: string }> => {
             let slot;
             try { slot = claimWorker(entry.emp, entry.task, replayMeta); }
             catch (err) {
@@ -668,20 +677,37 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
                 const result = await runSingleAgent(ap, entry.emp, worklog, 1, { origin: 'api', projectDirs: dispatchCtx?.projectDirs }, []);
                 const resultTools = Array.isArray(result["tools"]) ? result["tools"] : [];
                 updateWorkerTools(slot.agentId, resultTools);
-                finishWorker(slot.agentId, String(result["text"] || ''), resultTools);
+                const text = String(result["text"] || '');
+                finishWorker(slot.agentId, text, resultTools);
                 recordDispatch();
-                return { agent: entry.agentName, ok: true, text: String(result["text"] || '') };
+                const run = getWorkerRunRecord(slot.runId);
+                return {
+                    agent: entry.agentName,
+                    ok: true,
+                    runId: slot.runId,
+                    status: run?.status || 'done',
+                    preview: previewText(text, 600) || '',
+                    recoveryCommand: `cli-jaw worker read ${slot.runId} --tail 120`,
+                    outputBytes: run?.outputBytes || 0,
+                };
             } catch (err: unknown) {
-                const msg = (err as Error)?.message || String(err);
+                const msg = previewText((err as Error)?.message || String(err), 600) || 'unknown error';
                 failWorker(slot.agentId, msg);
-                return { agent: entry.agentName, ok: false, error: msg };
+                return {
+                    agent: entry.agentName,
+                    ok: false,
+                    runId: slot.runId,
+                    status: 'failed',
+                    error: msg,
+                    recoveryCommand: `cli-jaw worker status ${slot.runId}`,
+                };
             }
         };
 
         const parallelEntries = entries.filter((_, i) => parallelResolved.get(i));
         const sequentialEntries = entries.filter((_, i) => !parallelResolved.get(i));
 
-        const results: { agent: string; ok: boolean; text?: string; error?: string }[] = [];
+        const results: { agent: string; ok: boolean; runId?: string; status?: string; preview?: string; recoveryCommand?: string; outputBytes?: number; error?: string }[] = [];
         if (parallelEntries.length > 0) {
             const settled = await Promise.allSettled(parallelEntries.map(e => runOne(e)));
             for (const s of settled) {
@@ -695,6 +721,31 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
         res.json({ ok: true, results });
     });
 
+    app.get('/api/orchestrate/worker-runs', requireAuth, (_req, res) => {
+        res.json({ ok: true, runs: listWorkerRunRecords() });
+    });
+
+    app.get('/api/orchestrate/worker-runs/:runId', requireAuth, (req, res) => {
+        const runId = String(req.params["runId"] || '');
+        const run = getWorkerRunRecord(runId);
+        if (!run) return fail(res, 404, 'worker run not found');
+        res.json({ ok: true, run });
+    });
+
+    app.get('/api/orchestrate/worker-runs/:runId/events', requireAuth, (req, res) => {
+        const runId = String(req.params["runId"] || '');
+        if (!getWorkerRunRecord(runId)) return fail(res, 404, 'worker run not found');
+        res.json({ ok: true, events: listWorkerRunEvents(runId) });
+    });
+
+    app.get('/api/orchestrate/worker-runs/:runId/output', requireAuth, (req, res) => {
+        const runId = String(req.params["runId"] || '');
+        if (!getWorkerRunRecord(runId)) return fail(res, 404, 'worker run not found');
+        const offset = Number(req.query["offset"] || 0);
+        const limit = Number(req.query["limit"] || 0);
+        res.json({ ok: true, output: readWorkerRunOutput(runId, { offset, limit }) });
+    });
+
     // Phase 7-4: explicit result polling for 409 retries and reconnects.
     app.get('/api/orchestrate/worker/:agentId/result', requireAuth, (req, res) => {
         const agentId = String(req.params["agentId"] || '');
@@ -705,6 +756,8 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
             res.json({
                 ok: true,
                 state: 'running',
+                runId: slot.runId,
+                agentId: slot.agentId,
                 startedAt: slot.startedAt,
                 task: slot.task,
                 tools: slot.tools,
@@ -720,6 +773,8 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
         res.json({
             ok: true,
             state: slot.state,
+            runId: slot.runId,
+            agentId: slot.agentId,
             result: slot.result,
             tools: slot.tools,
             // Verdict/persistence block — the always-poll CLI prints this

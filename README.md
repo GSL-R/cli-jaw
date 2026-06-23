@@ -5,7 +5,7 @@
 ### Your personal AI agent. 2 lines to install. 13 AI runtime surfaces in one dashboard.
 
 [![npm](https://img.shields.io/npm/v/cli-jaw)](https://npmjs.com/package/cli-jaw)
-[![Version](https://img.shields.io/badge/v2.1.3-GA-brightgreen)](https://github.com/lidge-jun/cli-jaw/releases)
+[![Version](https://img.shields.io/badge/v2.2.0-GA-brightgreen)](https://github.com/lidge-jun/cli-jaw/releases)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-blue)](https://typescriptlang.org)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.4-blue)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
@@ -39,6 +39,22 @@ jaw dashboard
 That's it. Open **http://localhost:24576** for the manager dashboard. Per-instance agent Web UIs still run from **http://localhost:3457** when you start `jaw serve`. Requires [Node.js 22.4+](https://nodejs.org).
 
 > **First time?** The default npm install initializes CLI-JAW and attempts native Claude setup. Other AI CLIs are optional; install them all during npm setup with `CLI_JAW_INSTALL_CLI_TOOLS=1 npm install -g cli-jaw` on macOS/Linux. On Windows, use the WSL install path below.
+
+### Optional JWC Runtime
+
+JWC is optional and external-only. The default npm install and Electron desktop sidecar do not bundle `jawcode`, `@jawcode-dev`, `@oven`, `bun`, or a `jwc` payload. To use JWC, install the runtime into CLI-JAW's external prefix and opt in with the printed SDK path:
+
+```bash
+jaw jwc install
+export JWC_SDK_PATH="/absolute/path/printed/by/jaw-jwc-install/sdk.js"
+jaw jwc doctor
+```
+
+To remove the optional external JWC dependencies later:
+
+```bash
+jaw jwc clean
+```
 
 <details>
 <summary><b>macOS one-click</b> — don't have Node.js? This installs everything</summary>
@@ -397,7 +413,7 @@ P (Plan) → A (Audit) → B (Build) → C (Check) → D (Done) → IDLE
 | **C — Check** | Type-check (`tsc --noEmit`), docs update, consistency check |
 | **D — Done** | Summary of all changes. Returns to idle |
 
-State is database-persisted and survives restarts. Workers cannot modify files — only verify. Activate with `jaw orchestrate`, `/orchestrate`, or `/pabcd`; resume an active worklog explicitly with `/continue`. Workflow helper slash commands are exposed as `/plan`, `/interview`, `/deliberate`, `/planaudit`, and `/goal`; `/plan` is a compatibility guide that explains "this is PABCD P" and points to the right next command instead of creating a second planning mode. Bounded automation is expressed as `/goal run ...`, not a separate top-level `/autopilot`. Durable goals — `/goal <objective>` plus `update`/`done`/`cancel`/`pause`/`resume` — are functional and survive restarts, and a goal resume re-fires the work on every interface (Web/CLI included, not just messaging). `/goal run` (`preflight`/`start`/`stop`/`status`) is a tracking-only preview: it gates on preflight and tracks turn/dispatch budget, with enforcement still to come.
+State is database-persisted and survives restarts. Workers cannot modify files — only verify. Activate with `jaw orchestrate`, `/orchestrate`, or `/pabcd`; resume an active worklog explicitly with `/continue`. Workflow helper slash commands are exposed as `/plan`, `/interview`, `/deliberate`, `/planaudit`, `/review`, `/search`, and `/goal`; `/plan` is a compatibility guide that explains "this is PABCD P" and points to the right next command instead of creating a second planning mode. `/search <query>` routes search intent through the active search skill: classify local vs external lookup, rewrite focused queries, discover candidate URLs, and only then use browser commands such as `browser fetch` for evidence verification. Bounded automation is expressed as `/goal run ...`, not a separate top-level `/autopilot`. Durable goals — `/goal <objective>` plus `update`/`done`/`cancel`/`pause`/`resume` — are functional and survive restarts, and a goal resume re-fires the work on every interface (Web/CLI included, not just messaging). `/goal run` (`preflight`/`start`/`stop`/`status`) is a tracking-only preview: it gates on preflight and tracks turn/dispatch budget, with enforcement still to come.
 
 ---
 
@@ -464,7 +480,7 @@ Computer Use lets you control any macOS app — Finder, Safari, System Settings,
 📱 Telegram ←→ 🦈 CLI-JAW ←→ 🤖 AI Engines
 ```
 
-Text chat, voice messages (auto-transcribed via STT — speech-to-text), file/photo upload, slash commands (`/cli`, `/model`, `/status`, `/plan`, `/interview`, `/deliberate`, `/planaudit`), scheduled task delivery via `every`/`cron` (recurring schedule) heartbeat jobs.
+Text chat, voice messages (auto-transcribed via STT — speech-to-text), file/photo upload, slash commands (`/cli`, `/model`, `/status`, `/plan`, `/interview`, `/deliberate`, `/planaudit`, `/review`, `/search`), scheduled task delivery via `every`/`cron` (recurring schedule) heartbeat jobs.
 
 <details>
 <summary>Setup (3 steps)</summary>
@@ -547,6 +563,9 @@ jaw browser snapshot              # capture page state
 jaw browser vision-click "Login"  # AI-powered click
 jaw browser web-ai status         # ChatGPT/Gemini/Grok web-AI session tooling
 jaw browser web-ai code --vendor chatgpt --model thinking --effort heavy --prompt "Build an MVP" --output-zip ./result.zip
+
+# Search
+# in chat: /search "npm trusted publishing official docs"  # search-skill routing + evidence verification
 
 # Dashboard connectors
 jaw dashboard memory search "query"  # read-only cross-instance memory search

@@ -465,13 +465,16 @@ test('code backend normalizes JWC session title metadata and returns title on lo
     assert.ok(host.includes('if (stored?.title) info.title = stored.title'), 'loadSession must attach stored title to returned session');
 });
 
-test('code ACP host prefers bundled jawcode CLI before global jwc fallback', () => {
+test('code ACP host prefers explicitly installed local jawcode CLI before global jwc fallback', () => {
     const host = read('src/code-mode/acp-host.ts');
 
     const localBinIndex = host.indexOf("join(process.cwd(), 'node_modules', '.bin', 'jwc')");
     const globalFallbackIndex = host.indexOf("return { cmd: 'jwc', args: ['--mode', 'acp'] }");
-    assert.ok(localBinIndex > 0, 'ACP host must consider the package-local jawcode .bin/jwc');
-    assert.ok(globalFallbackIndex > localBinIndex, 'package-local jawcode .bin/jwc must be tried before global jwc fallback');
+    assert.ok(localBinIndex > 0, 'ACP host must consider an explicitly installed package-local jawcode .bin/jwc');
+    assert.ok(globalFallbackIndex > localBinIndex, 'explicitly installed package-local jawcode .bin/jwc must be tried before global jwc fallback');
     assert.ok(host.includes('stale global jwc shim'), 'resolver comment must document why local jawcode is preferred');
+    assert.ok(host.includes('cli-jaw never bundles JWC'), 'resolver comment must document the no-bundled-JWC boundary');
     assert.ok(host.includes("join(MODULE_DIR, '..', '..', '..', 'node_modules', '.bin', 'jwc')"), 'dist runtime must resolve package-local jawcode from MODULE_DIR');
+    assert.equal(host.includes("join(MODULE_DIR, '..', '..', '..', 'bin', 'jwc')"), false, 'dist runtime must not resolve a bundled sidecar jwc shim');
+    assert.equal(host.includes("join(process.cwd(), 'bin', 'jwc')"), false, 'repo runtime must not resolve a bundled source jwc shim');
 });

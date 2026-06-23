@@ -50,7 +50,7 @@ public/
 | `public/js/diagram/` | 3 | SVG/iframe diagram pipeline |
 | `public/js/render/` | 18 | markdown/KaTeX/Mermaid/SVG/file-link/post-render/structured card renderer 책임 분리 |
 | `public/js/features/` | 52 | settings 분해 + help/attention/orchestrate scope + process-step-match + preview shortcut/invalidate bridge + MCP registry + chat-search + workflow-event-adapter + media-lightbox + elicitation-state + Pi settings + project git header status 포함 |
-| `public/manager/src/` | 300 | React 19 manager dashboard |
+| `public/manager/src/` | 304 | React 19 manager dashboard |
 | `public/css/` | 12 | theme/layout/chat/markdown/tool UI/diagram/trace drawer/workflow cockpit/chat-search |
 | `public/locales/` | 4 | `ko.json`, `en.json`, `ja.json`, `zh.json` |
 | `public/assets/providers/` | 18 | provider SVG 세트 |
@@ -265,7 +265,7 @@ settings.ts (barrel)
 - Pi model field는 발견된 모델이 있으면 `SelectField`를 사용하고, 목록이 비어 있을 때만 free-text `TextField`로 fallback한다.
 - 등록 성공 시 `settings.pi.profiles`, `settings.pi.discoveredModels`, `perCli.pi.provider`, `perCli.pi.model` draft가 함께 갱신되어 Pi model dropdown에 새 모델이 바로 나타난다.
 | `manager/src/jaw-ceo/` | Jaw CEO console panels, orchestration-control actions, voice, virtual timeline |
-| `manager/src/goal-status/` `manager/src/background-tasks/` `manager/src/workers/` | Code mode runtime-observability monitors for goal/PABCD, background tasks, web-ai bgtask bridges, and worker progress |
+| `manager/src/goal-status/` `manager/src/background-tasks/` `manager/src/workers/` | Manager runtime-observability monitors for goal/PABCD, background tasks, web-ai bgtask bridges, worker progress, durable worker runs, shared status-category display contracts, safe event timelines, and explicit bounded raw-output drill-down |
 | `manager/src/notes/` | markdown notes, search sidebar, WYSIWYG editing, wikilinks, graph view |
 | `manager/src/hooks/` | dashboard registry/view persistence/instance message events hooks |
 | `manager/src/sync/` | dashboard sync helpers (invalidation bus, iframe/visibility bridge) |
@@ -273,7 +273,7 @@ settings.ts (barrel)
 | `manager/src/clipboard/` | copy-text utility |
 | `manager/src/lib/` | shared utilities (preview-prefs, use-hidden-unload) |
 
-Manager 서버는 `jaw dashboard serve`가 실행하는 `src/manager/server.ts`이며 기본 port는 `24576`. React manager app은 `/api/manager/events`, `/api/dashboard/instances`, `/i/:port/api/messages/latest` 계열 polling으로 상태를 읽는다. Worker live bridge는 browser가 직접 EventSource를 여는 구조가 아니라 manager server의 `src/manager/worker-events.ts` + `src/manager/worker-sse-client.ts`가 각 worker instance `GET /api/events`를 server-side 구독하고 latest-message cache를 갱신하는 구조다. Jaw CEO right panel은 completion/watch/voice/orchestration control을 소유하고, Code mode monitor panels는 `/api/manager/runtime-status`, `/api/bgtask`, `/api/orchestrate/worker-progress` 기반 runtime observability를 소유한다. web-ai long task는 BrowserPanel이나 Code transcript가 아니라 `preset: "web-ai"` background task로 등록되며, monitor retry도 native web-ai session id를 보존한 preset 재등록을 사용한다. Background task monitor는 terminal completion, cancellation/orphaning, and notification handoff 모두를 `bgtask_update` + `GET /api/bgtask` hydration으로 반영한다.
+Manager 서버는 `jaw dashboard serve`가 실행하는 `src/manager/server.ts`이며 기본 port는 `24576`. React manager app은 `/api/manager/events`, `/api/dashboard/instances`, `/i/:port/api/messages/latest` 계열 polling으로 상태를 읽는다. Worker live bridge는 browser가 직접 EventSource를 여는 구조가 아니라 manager server의 `src/manager/worker-events.ts` + `src/manager/worker-sse-client.ts`가 각 worker instance `GET /api/events`를 server-side 구독하고 latest-message cache를 갱신하는 구조다. Jaw CEO right panel은 completion/watch/voice/orchestration control을 소유하고, Code mode monitor panels는 `/api/manager/runtime-status`, `/api/bgtask`, `/api/orchestrate/worker-progress` 기반 runtime observability를 소유한다. web-ai long task는 BrowserPanel이나 Code transcript가 아니라 `preset: "web-ai"` background task로 등록되며, monitor retry도 native web-ai session id를 보존한 preset 재등록을 사용한다. Background task monitor는 terminal completion, cancellation/orphaning, and notification handoff 모두를 `bgtask_update` + `GET /api/bgtask` hydration으로 반영한다. Worker Runs and Background Tasks remain separate panels and stores, but their client contracts preserve shared `statusCategory` so UI comparisons do not duplicate native status mapping.
 
 ---
 

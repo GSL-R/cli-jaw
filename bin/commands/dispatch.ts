@@ -7,6 +7,7 @@ import { cliFetch, getCliAuthToken } from '../../src/cli/api-auth.js';
 import { shouldShowHelp, printAndExit } from '../helpers/help.js';
 import { errString, isConnRefused } from '../_http-client.js';
 import { unwrapEmployeeSummaries } from './dispatch-helpers.js';
+import { printBatchDispatchSummary, type BatchDispatchResultSummary } from './dispatch-batch-summary.js';
 import {
     displayShellCommand,
     displayShellCommandDetail,
@@ -15,7 +16,7 @@ import {
 if (shouldShowHelp(process.argv)) printAndExit(`
   jaw dispatch — send task to an employee agent
 
-  Usage: jaw dispatch --agent "Name" --task "instruction" [--watch]
+  Usage: jaw dispatch --agent "Name" --task "instruction" [--watch] [--quiet]
          jaw dispatch --virtual "security" --task "audit this change" [--role "security"]
          jaw dispatch --batch --agents '<JSON array>'
   Options:
@@ -27,8 +28,9 @@ if (shouldShowHelp(process.argv)) printAndExit(`
     --task <text>     Task instruction to send
     --mutable         Allow employee to write/modify files (default: read-only)
     --scope <path>    Restrict writes to a subdirectory (optional, requires --mutable)
-    --watch           Print live sanitized employee progress until completion
-    --json            JSON output
+    --watch           Print live sanitized employee progress until completion (default for human output)
+    --quiet           Suppress live progress summaries
+    --json            JSON output; suppresses human progress lines
   Batch mode:
     --batch           Enable batch parallel dispatch
     --agents <json>   JSON array of {agent|virtual, task, role?, cli?, model?, parallel?, mutable?, scope?, affected_files?}
@@ -76,7 +78,8 @@ const model = getFlag('--model');
 const task = getFlag('--task');
 const mutable = process.argv.includes('--mutable');
 const scope = getFlag('--scope');
-const watch = process.argv.includes('--watch');
+const quiet = process.argv.includes('--quiet');
+const json = process.argv.includes('--json');
 const isBatch = process.argv.includes('--batch');
 const batchAgentsRaw = getFlag('--agents');
 
@@ -95,7 +98,7 @@ if (isBatch) {
     }
     const BASE = getServerUrl();
     await getCliAuthToken();
-    console.log(`🚀 Batch dispatching ${batchAgents.length} agents...`);
+    if (!json && !quiet) console.log(`🚀 Batch dispatching ${batchAgents.length} agents...`);
     try {
         const res = await cliFetch(`${BASE}/api/orchestrate/dispatch/batch`, {
             method: 'POST',
@@ -107,14 +110,12 @@ if (isBatch) {
             console.error(`❌ ${body.error || `Failed: ${res.status}`}`);
             process.exit(1);
         }
-        let exitCode = 0;
-        for (const r of body.results || []) {
-            const status = r.ok ? '✅' : '❌';
-            console.log(`\n${status} ${r.agent}`);
-            if (r.text) console.log(r.text);
-            if (r.error) { console.error(`  Error: ${r.error}`); exitCode = 1; }
+        if (json) {
+            console.log(JSON.stringify(body));
+            process.exit((body.results || []).every(r => r.ok) ? 0 : 1);
         }
-        process.exit(exitCode);
+        if (quiet) process.exit((body.results || []).every(r => r.ok) ? 0 : 1);
+        process.exit(printBatchDispatchSummary(body.results || []));
     } catch (e: unknown) {
         console.error(`❌ Error: ${errString(e)}`);
         process.exit(1);
@@ -136,55 +137,29 @@ const targetName = virtual || agent || '';
 
 const STARTUP_RETRY_DELAYS_MS = [500, 1000, 1500, 2000, 3000];
 
-interface DispatchResultBody {
-    state?: string;
-    result?: { status?: string; text?: string; tools?: DispatchToolEntry[] } | string;
-    tools?: DispatchToolEntry[];
-    progress?: WorkerProgressSnapshotBody | null;
-    progressUpdatedAt?: number | null;
-    error?: string;
-    worker?: { agentId?: string; employeeName?: string; startedAt?: number };
-    existing?: { agentId?: string };
+type DispatchToolEntry = {
+    icon?: string; label?: string; detail?: string; toolType?: string;
+    status?: string; stepRef?: string; isEmployee?: boolean;
+};
+type WorkerProgressRunBody = { runId?: string; agentId?: string; state?: string; tools?: DispatchToolEntry[] };
+type WorkerProgressSnapshotBody = {
+    runId?: string | null; agentId?: string;
+    current?: WorkerProgressRunBody | null; previous?: WorkerProgressRunBody | null;
+};
+type WorkerProgressResponseBody = { ok?: boolean; progress?: WorkerProgressSnapshotBody | null; error?: string };
+type DispatchResultBody = {
+    state?: string; result?: { status?: string; text?: string; tools?: DispatchToolEntry[] } | string;
+    tools?: DispatchToolEntry[]; progress?: WorkerProgressSnapshotBody | null; progressUpdatedAt?: number | null;
+    error?: string; runId?: string; agentId?: string;
+    worker?: { agentId?: string; runId?: string; employeeName?: string; startedAt?: number };
+    existing?: { agentId?: string; runId?: string };
     orchestration?: {
-        verdict?: string;
-        statusPersisted?: boolean;
-        persistedField?: string;
-        currentState?: string;
-        ctxPresent?: boolean;
+        verdict?: string; statusPersisted?: boolean; persistedField?: string; currentState?: string; ctxPresent?: boolean;
     };
-}
-
-interface BatchDispatchBody {
-    ok?: boolean;
-    results?: { agent: string; ok: boolean; text?: string; error?: string }[];
-    error?: string;
-}
-
-interface WorkerProgressRunBody {
-    state?: string;
-    tools?: DispatchToolEntry[];
-}
-
-interface WorkerProgressSnapshotBody {
-    current?: WorkerProgressRunBody | null;
-    previous?: WorkerProgressRunBody | null;
-}
-
-interface WorkerProgressResponseBody {
-    ok?: boolean;
-    progress?: WorkerProgressSnapshotBody | null;
-    error?: string;
-}
-
-interface DispatchToolEntry {
-    icon?: string;
-    label?: string;
-    detail?: string;
-    toolType?: string;
-    status?: string;
-    stepRef?: string;
-    isEmployee?: boolean;
-}
+};
+type BatchDispatchBody = {
+    ok?: boolean; results?: BatchDispatchResultSummary[]; error?: string;
+};
 
 function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -223,7 +198,7 @@ async function resolveAgentId(name: string): Promise<string | null> {
 }
 
 class DispatchPollError extends Error {
-    constructor(message: string, public readonly agentId: string, public readonly agentName: string) {
+    constructor(message: string, public readonly agentId: string, public readonly agentName: string, public readonly runId?: string) {
         super(message);
         this.name = 'DispatchPollError';
     }
@@ -233,7 +208,7 @@ class DispatchPollError extends Error {
 // to kill a 10-minute poll loop on its first throw (devlog 260613 doc 08).
 const POLL_RETRY_DELAYS_MS = [500, 1000, 2000];
 
-async function pollFetch(url: string, agentId: string, agentName: string, label: string): Promise<Response> {
+async function pollFetch(url: string, agentId: string, agentName: string, label: string, runId?: string): Promise<Response> {
     let lastErr: unknown;
     for (let attempt = 0; attempt <= POLL_RETRY_DELAYS_MS.length; attempt++) {
         try {
@@ -243,30 +218,37 @@ async function pollFetch(url: string, agentId: string, agentName: string, label:
             if (attempt < POLL_RETRY_DELAYS_MS.length) await sleep(POLL_RETRY_DELAYS_MS[attempt]!);
         }
     }
-    throw new DispatchPollError(`${label}: ${errString(lastErr)}`, agentId, agentName);
+    throw new DispatchPollError(`${label}: ${errString(lastErr)}`, agentId, agentName, runId);
 }
 
-async function pollWorkerResult(agentId: string, agentName = ''): Promise<DispatchResultBody> {
+function runIdFromBody(body: DispatchResultBody): string | undefined {
+    return body.runId || body.worker?.runId || body.existing?.runId || progressRun(body.progress)?.runId || undefined;
+}
+
+async function pollWorkerResult(agentId: string, agentName = '', runId?: string): Promise<DispatchResultBody> {
     const deadline = Date.now() + 600_000;
     let lastState = 'unknown';
+    let knownRunId = runId;
     while (Date.now() < deadline) {
-        const res = await pollFetch(`${BASE}/api/orchestrate/worker/${encodeURIComponent(agentId)}/result`, agentId, agentName, 'dispatch poll failed');
+        const res = await pollFetch(`${BASE}/api/orchestrate/worker/${encodeURIComponent(agentId)}/result`, agentId, agentName, 'dispatch poll failed', knownRunId);
         const { body, nonJsonError } = await readJsonResponse<DispatchResultBody>(res, 'worker result endpoint');
-        if (nonJsonError) throw new DispatchPollError(nonJsonError, agentId, agentName);
-        if (!res.ok) throw new DispatchPollError(body.error || `poll failed: ${res.status}`, agentId, agentName);
+        knownRunId = runIdFromBody(body) || knownRunId;
+        if (nonJsonError) throw new DispatchPollError(nonJsonError, agentId, agentName, knownRunId);
+        if (!res.ok) throw new DispatchPollError(body.error || `poll failed: ${res.status}`, agentId, agentName, knownRunId);
         lastState = body.state || 'unknown';
         if (body.state !== 'running') return body;
         await sleep(2_000);
     }
-    throw new DispatchPollError(`timed out after 10 minutes (last state: ${lastState})`, agentId, agentName);
+    throw new DispatchPollError(`timed out after 10 minutes (last state: ${lastState})`, agentId, agentName, knownRunId);
 }
 
-async function fetchWorkerProgress(agentId: string, agentName = ''): Promise<WorkerProgressSnapshotBody | null> {
-    const res = await pollFetch(`${BASE}/api/orchestrate/worker-progress/${encodeURIComponent(agentId)}`, agentId, agentName, 'worker progress fetch failed');
+async function fetchWorkerProgress(agentId: string, agentName = '', runId?: string): Promise<WorkerProgressSnapshotBody | null> {
+    const res = await pollFetch(`${BASE}/api/orchestrate/worker-progress/${encodeURIComponent(agentId)}`, agentId, agentName, 'worker progress fetch failed', runId);
     const { body, nonJsonError } = await readJsonResponse<WorkerProgressResponseBody>(res, 'worker progress endpoint');
-    if (nonJsonError) throw new DispatchPollError(nonJsonError, agentId, agentName);
+    const bodyRunId = body.progress ? progressRun(body.progress)?.runId : undefined;
+    if (nonJsonError) throw new DispatchPollError(nonJsonError, agentId, agentName, bodyRunId || runId);
     if (res.status === 404) return null;
-    if (!res.ok) throw new DispatchPollError(body.error || `progress fetch failed: ${res.status}`, agentId, agentName);
+    if (!res.ok) throw new DispatchPollError(body.error || `progress fetch failed: ${res.status}`, agentId, agentName, bodyRunId || runId);
     return body.progress || null;
 }
 
@@ -346,27 +328,31 @@ function printProgressSnapshot(progress: WorkerProgressSnapshotBody | null | und
     });
 }
 
-async function pollAndPrintWorker(agentId: string, agentName: string): Promise<DispatchResultBody> {
+async function pollAndPrintWorker(agentId: string, agentName: string, runId?: string): Promise<DispatchResultBody> {
     const deadline = Date.now() + 600_000;
     const printed = new Set<string>();
     let lastState = 'unknown';
+    let knownRunId = runId;
     while (Date.now() < deadline) {
-        const progress = await fetchWorkerProgress(agentId, agentName);
+        const progress = await fetchWorkerProgress(agentId, agentName, knownRunId);
+        knownRunId = progressRun(progress)?.runId || knownRunId;
         printProgressSnapshot(progress, printed);
-        const body = await pollWorkerResultOnce(agentId, agentName);
+        const body = await pollWorkerResultOnce(agentId, agentName, knownRunId);
+        knownRunId = runIdFromBody(body) || knownRunId;
         lastState = body.state || lastState;
         printProgressSnapshot(body.progress, printed);
         if (body.state !== 'running') return body;
         await sleep(2_000);
     }
-    throw new DispatchPollError(`timed out after 10 minutes (last state: ${lastState})`, agentId, agentName);
+    throw new DispatchPollError(`timed out after 10 minutes (last state: ${lastState})`, agentId, agentName, knownRunId);
 }
 
-async function pollWorkerResultOnce(agentId: string, agentName = ''): Promise<DispatchResultBody> {
-    const res = await pollFetch(`${BASE}/api/orchestrate/worker/${encodeURIComponent(agentId)}/result`, agentId, agentName, 'dispatch poll failed');
+async function pollWorkerResultOnce(agentId: string, agentName = '', runId?: string): Promise<DispatchResultBody> {
+    const res = await pollFetch(`${BASE}/api/orchestrate/worker/${encodeURIComponent(agentId)}/result`, agentId, agentName, 'dispatch poll failed', runId);
     const { body, nonJsonError } = await readJsonResponse<DispatchResultBody>(res, 'worker result endpoint');
-    if (nonJsonError) throw new DispatchPollError(nonJsonError, agentId, agentName);
-    if (!res.ok) throw new DispatchPollError(body.error || `poll failed: ${res.status}`, agentId, agentName);
+    const knownRunId = runIdFromBody(body) || runId;
+    if (nonJsonError) throw new DispatchPollError(nonJsonError, agentId, agentName, knownRunId);
+    if (!res.ok) throw new DispatchPollError(body.error || `poll failed: ${res.status}`, agentId, agentName, knownRunId);
     return body;
 }
 
@@ -388,6 +374,14 @@ function printDispatchResult(agentName: string, body: DispatchResultBody, opts: 
     }
 }
 
+function printJsonResult(body: DispatchResultBody): void {
+    console.log(JSON.stringify(body, null, 2));
+}
+
+function shouldPrintLiveProgress(): boolean {
+    return !json && !quiet;
+}
+
 function printFetchErrorWithRecovery(message: string): void {
     console.error(`❌ Error: ${message}`);
     if (!message.includes('fetch failed')) return;
@@ -395,9 +389,21 @@ function printFetchErrorWithRecovery(message: string): void {
     console.error(`  target:  cli-jaw worker status "${targetName}"`);
 }
 
+function printPollErrorWithRecovery(e: DispatchPollError): void {
+    console.error(`❌ ${e.message}`);
+    console.error(`  agentId:  ${e.agentId}`);
+    if (e.runId) console.error(`  runId:    ${e.runId}`);
+    console.error(`  agent:    ${e.agentName || targetName}`);
+    if (e.runId) {
+        console.error(`  status:   cli-jaw worker status ${e.runId}`);
+        console.error(`  output:   cli-jaw worker read ${e.runId} --tail 80`);
+    } else console.error(`  status:   cli-jaw worker status "${e.agentName || targetName}"`);
+    console.error(`  poll:     curl -s ${BASE}/api/orchestrate/worker/${encodeURIComponent(e.agentId)}/result`);
+}
+
 await getCliAuthToken(PORT);
 try {
-    console.log(`🚀 Dispatching to ${targetName}...`);
+    if (!json && !quiet) console.log(`🚀 Dispatching to ${targetName}...`);
 
     let res: Response | undefined;
     let lastError: unknown;
@@ -454,42 +460,37 @@ try {
     }
     if (res.status === 202) {
         const pollAgentId = body?.worker?.agentId || (agent ? await resolveAgentId(agent) : null);
-        if (!pollAgentId) {
-            console.error('❌ dispatch started but worker id was not returned');
-            process.exit(1);
-        }
-        const polled = watch
-            ? await pollAndPrintWorker(pollAgentId, targetName)
-            : await pollWorkerResult(pollAgentId, targetName);
-        printDispatchResult(targetName, polled, watch ? { skipProcess: true } : {});
+        if (!pollAgentId) { console.error('❌ dispatch started but worker id was not returned'); process.exit(1); }
+        const pollRunId = body?.worker?.runId;
+        const liveProgress = shouldPrintLiveProgress();
+        const polled = liveProgress ? await pollAndPrintWorker(pollAgentId, targetName, pollRunId) : await pollWorkerResult(pollAgentId, targetName, pollRunId);
+        if (json) printJsonResult(polled);
+        else printDispatchResult(targetName, polled, liveProgress ? { skipProcess: true } : {});
         process.exit(dispatchExitCode(polled));
     }
     if (!res.ok) {
         if (res.status === 409) {
             const pollAgentId = body?.worker?.agentId || body?.existing?.agentId || (agent ? await resolveAgentId(agent) : null);
-            if (!pollAgentId) {
-                console.error(`❌ ${body.error || `Failed: ${res.status}`}`);
-                process.exit(1);
+            if (!pollAgentId) { console.error(`❌ ${body.error || `Failed: ${res.status}`}`); process.exit(1); }
+            const pollRunId = body?.worker?.runId || body?.existing?.runId;
+            if (!json && !quiet) {
+                console.error(`⏳ ${targetName} is already running (agentId: ${pollAgentId}${pollRunId ? `, runId: ${pollRunId}` : ''}), polling worker result...`);
             }
-            console.error(`⏳ ${targetName} is already running (agentId: ${pollAgentId}), polling worker result...`);
-            const polled = watch
-                ? await pollAndPrintWorker(pollAgentId, targetName)
-                : await pollWorkerResult(pollAgentId, targetName);
-            printDispatchResult(targetName, polled, watch ? { skipProcess: true } : {});
+            const liveProgress = shouldPrintLiveProgress();
+            const polled = liveProgress ? await pollAndPrintWorker(pollAgentId, targetName, pollRunId) : await pollWorkerResult(pollAgentId, targetName, pollRunId);
+            if (json) printJsonResult(polled);
+            else printDispatchResult(targetName, polled, liveProgress ? { skipProcess: true } : {});
             process.exit(dispatchExitCode(polled));
         }
         console.error(`❌ ${body.error || `Failed: ${res.status}`}`);
         process.exit(1);
     }
-    printDispatchResult(targetName, body);
+    if (json) printJsonResult(body);
+    else printDispatchResult(targetName, body);
     process.exit(dispatchExitCode(body));
 } catch (e: unknown) {
     if (e instanceof DispatchPollError) {
-        console.error(`❌ ${e.message}`);
-        console.error(`  agentId:  ${e.agentId}`);
-        console.error(`  agent:    ${e.agentName || targetName}`);
-        console.error(`  recover:  cli-jaw dispatch ${agent ? '--agent' : '--virtual'} "${e.agentName || targetName}" --task "(resume polling)"`);
-        console.error(`  poll:     curl -s ${BASE}/api/orchestrate/worker/${encodeURIComponent(e.agentId)}/result`);
+        printPollErrorWithRecovery(e);
     } else {
         printFetchErrorWithRecovery(errString(e));
     }
