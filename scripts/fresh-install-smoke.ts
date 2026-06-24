@@ -76,6 +76,35 @@ function npmGlobalBin(prefix: string): string {
     return path.join(prefix, 'bin');
 }
 
+function verifyInstalledWebUi(pkgDir: string): void {
+    const publicDir = path.join(pkgDir, 'public');
+    const distDir = path.join(publicDir, 'dist');
+    const indexPath = path.join(distDir, 'index.html');
+    const assetsDir = path.join(distDir, 'assets');
+    if (!fs.existsSync(indexPath)) {
+        throw new Error(`web UI build missing from installed package: ${indexPath}`);
+    }
+    if (!fs.existsSync(assetsDir)) {
+        throw new Error(`web UI assets missing from installed package: ${assetsDir}`);
+    }
+
+    const indexHtml = fs.readFileSync(indexPath, 'utf8');
+    if (!/\/dist\/assets\/app-[^"']+\.js/.test(indexHtml)) {
+        throw new Error('installed web UI index does not reference bundled /dist/assets/app-*.js');
+    }
+    if (indexHtml.includes('/js/main.ts')) {
+        throw new Error('installed web UI index still references TypeScript source /js/main.ts');
+    }
+
+    const assets = fs.readdirSync(assetsDir);
+    if (!assets.some(name => /^app-[\w-]+\.js$/.test(name))) {
+        throw new Error(`installed web UI has no app-*.js in ${assetsDir}`);
+    }
+    if (!assets.some(name => /^app-[\w-]+\.css$/.test(name))) {
+        throw new Error(`installed web UI has no app-*.css in ${assetsDir}`);
+    }
+}
+
 interface NpmPackResult {
     filename?: string;
 }
@@ -131,6 +160,7 @@ async function main(): Promise<void> {
         const pkgDir = resolveInstalledPackage(prefix);
         const jawEntry = path.join(pkgDir, 'dist', 'bin', 'cli-jaw.js');
         if (!fs.existsSync(jawEntry)) throw new Error(`cli entry not found: ${jawEntry}`);
+        verifyInstalledWebUi(pkgDir);
 
         const jawEnv: NodeJS.ProcessEnv = {
             ...process.env,

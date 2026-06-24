@@ -1,4 +1,5 @@
 import type { SpawnContext, ToolEntry } from '../types/agent.js';
+import fs from 'node:fs';
 import {
     agyTranscriptStepKey,
     classifyAgyTranscriptRow,
@@ -23,6 +24,27 @@ const POLL_MS = 800;
 const WAIT_PATH_MS = 120_000;
 const CURRENT_TURN_LOOKBACK_MS = 5_000;
 const RETARGET_SCAN_MS = 2_000;
+const CHECKPOINT_STALL_MS = Math.max(
+    1_000,
+    Number(process.env['JAW_AGY_CHECKPOINT_STALL_MS']) || 120_000,
+);
+
+function transcriptRowType(line: string): string {
+    try {
+        const parsed = JSON.parse(line) as { type?: unknown };
+        return typeof parsed.type === 'string' ? parsed.type : '';
+    } catch {
+        return '';
+    }
+}
+
+function transcriptMtimeMs(transcriptPath: string): number {
+    try {
+        return fs.statSync(transcriptPath).mtimeMs;
+    } catch {
+        return 0;
+    }
+}
 
 function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs: number): void {
     let rowType = '';
@@ -124,6 +146,7 @@ export function startAgyTranscriptWatcher(options: {
     traceAudience: 'public' | 'internal';
     onEmit: AgyTranscriptEmit;
     onActivity?: () => void;
+    onCheckpointStall?: (stalledMs: number, conversationId: string | null) => void;
 }): AgyTranscriptWatcherHandle {
     let offset = 0;
     let transcriptPath: string | null = null;
@@ -132,11 +155,15 @@ export function startAgyTranscriptWatcher(options: {
     const startedAt = Date.now();
     const minCreatedAtMs = startedAt - CURRENT_TURN_LOOKBACK_MS;
     let lastRetargetScanAt = 0;
+    let checkpointSeenAt = 0;
+    let checkpointStallReported = false;
 
     const resetSelection = () => {
         transcriptPath = null;
         conversationId = null;
         offset = 0;
+        checkpointSeenAt = 0;
+        checkpointStallReported = false;
         options.ctx.agyFinalPlannerSeen = false;
         options.ctx.agyFinalPlannerText = undefined;
         options.ctx.agyLastTranscriptError = undefined;
@@ -160,9 +187,14 @@ export function startAgyTranscriptWatcher(options: {
             return;
         }
         if (transcriptPath === effectiveResolved.transcriptPath) return;
+        const previousMtimeMs = transcriptPath ? transcriptMtimeMs(transcriptPath) : 0;
+        const nextMtimeMs = transcriptMtimeMs(effectiveResolved.transcriptPath);
+        if (transcriptPath && nextMtimeMs < previousMtimeMs) return;
         transcriptPath = effectiveResolved.transcriptPath;
         conversationId = effectiveResolved.conversationId ?? currentSessionId ?? null;
         offset = 0;
+        checkpointSeenAt = 0;
+        checkpointStallReported = false;
         options.ctx.agyFinalPlannerSeen = false;
         options.ctx.agyFinalPlannerText = undefined;
         options.ctx.agyLastTranscriptError = undefined;
@@ -182,6 +214,13 @@ export function startAgyTranscriptWatcher(options: {
             const delta = readTranscriptDelta(transcriptPath, offset);
             offset = delta.offset;
             for (const line of delta.lines) {
+                const rowType = transcriptRowType(line);
+                if (rowType === 'CHECKPOINT') {
+                    checkpointSeenAt = Date.now();
+                    checkpointStallReported = false;
+                } else if (checkpointSeenAt) {
+                    checkpointSeenAt = 0;
+                }
                 updateFinalPlannerFlag(options.ctx, line, minCreatedAtMs);
                 applyTranscriptTool(
                     options.ctx,
@@ -200,6 +239,14 @@ export function startAgyTranscriptWatcher(options: {
                 // (planner/thinking rows are dropped by the tool parser but still count).
                 options.ctx.agyTranscriptActive = true;
                 options.onActivity?.();
+            }
+            if (
+                checkpointSeenAt
+                && !checkpointStallReported
+                && Date.now() - checkpointSeenAt >= CHECKPOINT_STALL_MS
+            ) {
+                checkpointStallReported = true;
+                options.onCheckpointStall?.(Date.now() - checkpointSeenAt, conversationId);
             }
         } catch (e) {
             console.warn('[jaw:agy:transcript] read failed:', (e as Error).message);

@@ -9,12 +9,29 @@ export function escapeHtmlTg(text: string) {
 
 export function markdownToTelegramHtml(md: string) {
     if (!md) return '';
-    let html = escapeHtmlTg(md);
+    const preservedTags: string[] = [];
+    let openAnchors = 0;
+    const supportedTag = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)>|<span class="tg-spoiler">|<\/span>|<a href="(?:https?:\/\/|tg:\/\/)[^"]+">|<\/a>|<tg-emoji emoji-id="\d+">|<\/tg-emoji>|<code class="language-[A-Za-z0-9_+-]+">/gi;
+    const withPlaceholders = md.replace(supportedTag, (tag) => {
+        const normalizedTag = tag.toLowerCase();
+        if (normalizedTag.startsWith('<a href=')) openAnchors += 1;
+        if (normalizedTag === '</a>') {
+            if (openAnchors === 0) return tag;
+            openAnchors -= 1;
+        }
+        const placeholder = `JAWHTMLTOKEN${preservedTags.length}X`;
+        preservedTags.push(tag);
+        return placeholder;
+    });
+    let html = escapeHtmlTg(withPlaceholders);
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
     html = html.replace(/(?<![*])\*(?![*])(.+?)(?<![*])\*(?![*])/g, '<i>$1</i>');
     html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
+    preservedTags.forEach((tag, index) => {
+        html = html.replace(`JAWHTMLTOKEN${index}X`, tag);
+    });
     return html;
 }
 

@@ -139,6 +139,20 @@ test('markdownToTelegramHtml converts markdown while preserving escaped html', (
     assert.equal(html.includes('&lt;x&gt;'), true);
 });
 
+test('markdownToTelegramHtml preserves supported Telegram HTML only', () => {
+    const html = markdownToTelegramHtml('<b>bold</b> <a href="https://example.com">link</a> <x>unsafe</x>');
+    assert.equal(html.includes('<b>bold</b>'), true);
+    assert.equal(html.includes('<a href="https://example.com">link</a>'), true);
+    assert.equal(html.includes('&lt;x&gt;unsafe&lt;/x&gt;'), true);
+});
+
+test('markdownToTelegramHtml rejects unsafe raw link schemes', () => {
+    const html = markdownToTelegramHtml('<a href="javascript:alert(1)">unsafe</a>');
+    assert.equal(html.includes('<a href="javascript:'), false);
+    assert.equal(html.includes('&lt;a href="javascript:'), true);
+    assert.equal(html.includes('&lt;/a&gt;'), true);
+});
+
 test('escapeHtmlTg escapes angle brackets and ampersands', () => {
     assert.equal(escapeHtmlTg('<a&b>'), '&lt;a&amp;b&gt;');
 });

@@ -5,9 +5,19 @@ import { basename, dirname } from 'path';
 import crypto from 'crypto';
 import { settings, HEARTBEAT_JOBS_PATH, loadHeartbeatFile, saveHeartbeatFile } from '../core/config.js';
 import { stripUndefined } from '../core/strip-undefined.js';
-import { isAgentBusy, messageQueue } from '../agent/spawn.js';
+import { getEmployees } from '../core/db.js';
 import { orchestrateAndCollect } from '../orchestrator/collect.js';
-import { hasPendingWorkerReplays } from '../orchestrator/worker-registry.js';
+import { isAgentBusy, messageQueue, spawnAgent } from '../agent/spawn.js';
+import { getEmployeePrompt } from '../prompt/builder.js';
+import { findEmployee } from '../orchestrator/distribute.js';
+import {
+    claimWorker,
+    failWorker,
+    finishWorker,
+    hasPendingWorkerReplays,
+    updateWorkerTools,
+    WorkerBusyError,
+} from '../orchestrator/worker-registry.js';
 import { broadcast } from '../core/bus.js';
 import { sendChannelOutput } from '../messaging/send.js';
 import { insertHeartbeatAnchor } from '../core/db.js';
@@ -36,6 +46,11 @@ interface PendingHeartbeatJob {
     policy?: HeartbeatPendingPolicy;
 }
 const pendingJobs: PendingHeartbeatJob[] = [];
+
+type HeartbeatRunResult = {
+    text: string;
+    visible: boolean;
+};
 
 function pendingSnapshot(reason?: HeartbeatPendingReason, policy?: HeartbeatPendingPolicy) {
     const deferredPending = pendingJobs.filter(item => item.policy === 'defer').length;
@@ -66,6 +81,112 @@ function queueHeartbeatJob(
 
 export function getHeartbeatRuntimeState() {
     return pendingSnapshot();
+}
+
+function heartbeatReportPolicy(job: Record<string, any>): 'always' | 'anomaly_only' | 'silent' {
+    const raw = typeof job["reportPolicy"] === 'string' ? job["reportPolicy"].toLowerCase() : '';
+    if (raw === 'anomaly_only' || raw === 'silent' || raw === 'always') return raw;
+    return 'always';
+}
+
+function isEmployeeHeartbeat(job: Record<string, any>): boolean {
+    return job["runner"] === 'employee' || typeof job["employee"] === 'string';
+}
+
+function shouldShowEmployeeResult(text: string, policy: 'always' | 'anomaly_only' | 'silent'): boolean {
+    if (policy === 'always') return true;
+    if (policy === 'silent') return false;
+    const lower = text.toLowerCase();
+    if (/status\s*:\s*(warning|failed|fail|error)/i.test(text)) return true;
+    if (/user_visible\s*:\s*(yes|true)/i.test(text)) return true;
+    if (/record_required\s*:\s*(yes|true)/i.test(text)) return true;
+    if (lower.includes('warning') || lower.includes('failed') || lower.includes('error')) return true;
+    if (text.includes('⚠') || text.includes('❌')) return true;
+    return false;
+}
+
+async function runEmployeeHeartbeatJob(job: Record<string, any>, prompt: string): Promise<HeartbeatRunResult> {
+    const employeeName = String(job["employee"] || job["agent"] || '').trim();
+    if (!employeeName) {
+        return {
+            text: `❌ heartbeat employee runner requires job.employee`,
+            visible: true,
+        };
+    }
+    const emps = getEmployees.all() as Record<string, any>[];
+    const emp = findEmployee(emps, { agent: employeeName });
+    if (!emp) {
+        return {
+            text: `❌ heartbeat employee not found: ${employeeName}`,
+            visible: true,
+        };
+    }
+
+    const task = [
+        prompt,
+        '',
+        '## Heartbeat Employee Report Contract',
+        'Return a concise report in this exact shape:',
+        'status: ok | warning | failed',
+        'changed: yes | no',
+        'record_required: yes | no',
+        'user_visible: yes | no',
+        'summary: ...',
+        'evidence: ...',
+        'next_action: ...',
+        '',
+        'If everything is normal and no user-facing action is needed, set status: ok and user_visible: no.',
+    ].join('\n');
+
+    let slot: ReturnType<typeof claimWorker> | null = null;
+    try {
+        slot = claimWorker({ id: String(emp["id"]), name: String(emp["name"] || emp["id"]) }, task, { origin: 'heartbeat' });
+    } catch (err) {
+        if (err instanceof WorkerBusyError) {
+            return {
+                text: `❌ heartbeat employee busy: ${err.existing.employeeName}`,
+                visible: true,
+            };
+        }
+        throw err;
+    }
+
+    try {
+        const sysPrompt = getEmployeePrompt({
+            name: String(emp["name"] || emp["id"]),
+            role: String(job["role"] || emp["role"] || 'heartbeat maintenance worker'),
+            id: String(emp["id"]),
+        });
+        const { promise } = spawnAgent(task, {
+            agentId: String(emp["id"]),
+            cli: String(emp["cli"] || settings["cli"] || ''),
+            model: String(emp["model"] || ''),
+            forceNew: job["resumeEmployee"] !== true,
+            sysPrompt,
+            origin: 'heartbeat',
+            env: {
+                JAW_EMPLOYEE_MODE: '1',
+                JAW_EMPLOYEE_NAME: String(emp["name"] || ''),
+                JAW_EMPLOYEE_ROLE: String(job["role"] || emp["role"] || 'heartbeat maintenance worker'),
+                JAW_WORKSPACE_ROOT: settings["workingDir"] || '',
+                PORT: String(process.env["PORT"] || ''),
+            },
+        });
+        const result = await promise as Record<string, unknown>;
+        const text = String(result["text"] || '').trim() || '[SILENT]';
+        const tools = Array.isArray(result["tools"]) ? result["tools"] : [];
+        updateWorkerTools(slot.agentId, tools as any[]);
+        finishWorker(slot.agentId, text, tools as any[]);
+        const policy = heartbeatReportPolicy(job);
+        return {
+            text,
+            visible: shouldShowEmployeeResult(text, policy),
+        };
+    } catch (err) {
+        const text = `❌ heartbeat employee runner failed: ${(err as Error).message}`;
+        if (slot) failWorker(slot.agentId, text);
+        return { text, visible: true };
+    }
 }
 
 export function startHeartbeat() {
@@ -127,9 +248,12 @@ async function runHeartbeatJob(job: Record<string, any>) {
         const prompt = `[heartbeat:${job["name"]}] 현재 시간: ${now} (${timeZone})\n\nBefore responding, you MUST search memory (cli-jaw memory search) for recent conversation context, user preferences, and ongoing tasks. Use this context to ground your response.${goalSection}\n\n${job["prompt"] || '정기 점검입니다. 할 일 없으면 [SILENT]로 응답.'}`;
         console.log(`[heartbeat:${job["name"]}] tick (${describeHeartbeatSchedule(schedule)})`);
         const requestId = crypto.randomUUID();
-        const result: string = String(await orchestrateAndCollect(prompt, { origin: 'heartbeat', requestId }));
+        const runResult = isEmployeeHeartbeat(job)
+            ? await runEmployeeHeartbeatJob(job, prompt)
+            : { text: String(await orchestrateAndCollect(prompt, { origin: 'heartbeat', requestId })), visible: true };
+        const result = runResult.text;
 
-        if (result.includes('[SILENT]')) {
+        if (!runResult.visible || result.includes('[SILENT]')) {
             console.log(`[heartbeat:${job["name"]}] silent`);
             return;
         }

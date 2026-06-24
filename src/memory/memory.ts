@@ -41,6 +41,14 @@ function resolveMemoryPath(filename: string) {
     return filepath;
 }
 
+function normalizeSavePath(filename: string): string {
+    const normalized = String(filename || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (/^episodes\/(arona|live|summary|monthly_essence)\//.test(normalized)) {
+        return `structured/${normalized}`;
+    }
+    return normalized;
+}
+
 // ─── Search (grep) ───────────────────────────────
 
 export function search(query: string) {
@@ -92,14 +100,15 @@ function injectCreatedAt(content: string): string {
 
 export function save(filename: string, content: string) {
     ensureMemoryDir();
-    const filepath = resolveMemoryPath(filename);
+    const saveName = normalizeSavePath(filename);
+    const filepath = resolveMemoryPath(saveName);
     fs.mkdirSync(join(filepath, '..'), { recursive: true });
     const unescaped = content.replace(/\\n/g, '\n');
     const isNew = !fs.existsSync(filepath);
     const body = isNew ? injectCreatedAt(unescaped) : unescaped;
     fs.appendFileSync(filepath, '\n' + body + '\n');
     void import('./runtime.js').then(m => {
-        const normalized = filename.replace(/\\/g, '/');
+        const normalized = saveName.replace(/\\/g, '/');
         if (normalized.startsWith('structured/')) {
             m.reindexIntegratedMemoryFile(filepath);
             return;
