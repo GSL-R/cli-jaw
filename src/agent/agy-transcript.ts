@@ -18,6 +18,9 @@ const NON_TOOL_TYPES = new Set([
 
 const LABEL_MAX = 120;
 const DETAIL_MAX = 400;
+const HOME_DIR = os.homedir();
+const BROAD_ROOTS = new Set(['/', HOME_DIR]);
+const BROAD_SEARCH_ROOTS = new Set(['/', HOME_DIR, path.join(HOME_DIR, '.cli-jaw')]);
 
 export function resolveAgyConversationIdFromCache(cwd: string): string | null {
     try {
@@ -286,6 +289,82 @@ export function classifyAgyTranscriptRow(line: string): { kind: AgyTranscriptRow
     if (NON_TOOL_TYPES.has(type)) return { kind: 'meta' };
     const tool = parseTranscriptLine(trimmed);
     return tool ? { kind: 'tool', tool } : { kind: 'tool' };
+}
+
+function unquoteAgyArg(value: unknown): string {
+    if (typeof value !== 'string') return '';
+    return value.trim().replace(/^"+|"+$/g, '').trim();
+}
+
+function isBroadPath(rawPath: unknown, roots: Set<string>): boolean {
+    const value = unquoteAgyArg(rawPath);
+    if (!value) return false;
+    let normalized = value;
+    try {
+        normalized = path.resolve(value);
+    } catch {
+        normalized = value.replace(/\/+$/g, '') || value;
+    }
+    return roots.has(normalized.replace(/\/+$/g, '') || normalized);
+}
+
+function hasBroadShellSearch(text: string): boolean {
+    return /\bfind\s+\/home\/[^/\s]+(?:\s|$)/.test(text)
+        || /\b(?:grep|rg)\b[\s\S]{0,120}\s\/home\/[^/\s]+(?:\s|$)/.test(text)
+        || /Task Description:\s*find\s+\/home\/[^/\s]+/i.test(text);
+}
+
+function unsafeReasonForToolCall(call: unknown): string | null {
+    if (!call || typeof call !== 'object') return null;
+    const record = call as Record<string, unknown>;
+    const name = String(record['name'] || '').toLowerCase();
+    const args = record['args'] && typeof record['args'] === 'object'
+        ? record['args'] as Record<string, unknown>
+        : {};
+    if (name === 'grep_search') {
+        if (isBroadPath(args['SearchPath'], BROAD_SEARCH_ROOTS)) {
+            return `unsafe AGY grep_search scope: ${unquoteAgyArg(args['SearchPath'])}`;
+        }
+        if (hasBroadShellSearch(JSON.stringify(args))) {
+            return 'unsafe AGY grep_search task includes broad home search';
+        }
+    }
+    if (name === 'list_dir' && isBroadPath(args['DirectoryPath'], BROAD_ROOTS)) {
+        return `unsafe AGY list_dir scope: ${unquoteAgyArg(args['DirectoryPath'])}`;
+    }
+    if (name === 'run_command' && hasBroadShellSearch(String(args['CommandLine'] || ''))) {
+        return 'unsafe AGY run_command broad home search';
+    }
+    return null;
+}
+
+export function detectUnsafeAgyLocalToolRequest(line: string): string | null {
+    let row: Record<string, unknown>;
+    try {
+        row = JSON.parse(line.trim()) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+    const type = typeof row['type'] === 'string' ? row['type'] : '';
+    if (type === 'PLANNER_RESPONSE' && Array.isArray(row['tool_calls'])) {
+        for (const call of row['tool_calls']) {
+            const reason = unsafeReasonForToolCall(call);
+            if (reason) return reason;
+        }
+    }
+    if (type === 'GREP_SEARCH') {
+        const content = String(row['content'] || '');
+        if (/Grep command timed out due to the size of the codebase/i.test(content)) {
+            return 'AGY grep_search timed out due to broad codebase scope';
+        }
+        if (hasBroadShellSearch(content)) {
+            return 'unsafe AGY grep_search content includes broad home search';
+        }
+    }
+    if (type === 'RUN_COMMAND' && hasBroadShellSearch(String(row['content'] || ''))) {
+        return 'unsafe AGY run_command content includes broad home search';
+    }
+    return null;
 }
 
 export function readTranscriptDelta(transcriptPath: string, offset: number): { offset: number; lines: string[] } {

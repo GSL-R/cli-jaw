@@ -2151,6 +2151,18 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                     }, 5_000);
                 }
             },
+            onUnsafeLocalTool: (reason, conversationId) => {
+                const detail = `${reason}${conversationId ? ` (conversation ${conversationId})` : ''}`;
+                console.log(`[jaw:watchdog] killing ${agentLabel} — ${detail}`);
+                ctx.stallReason = detail;
+                ctx.stallWatchdog?.stop();
+                if (child.pid) {
+                    killProcessTree(child.pid, 'SIGTERM');
+                    setTimeout(() => {
+                        try { killProcessTree(child.pid!, 'SIGKILL'); } catch { /* already dead */ }
+                    }, 5_000);
+                }
+            },
         });
     }
 

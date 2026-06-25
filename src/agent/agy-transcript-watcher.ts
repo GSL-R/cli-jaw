@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import {
     agyTranscriptStepKey,
     classifyAgyTranscriptRow,
+    detectUnsafeAgyLocalToolRequest,
     parseTranscriptLine,
     readTranscriptDelta,
     resolveAgyTranscriptPathForCurrentTurn,
@@ -147,6 +148,7 @@ export function startAgyTranscriptWatcher(options: {
     onEmit: AgyTranscriptEmit;
     onActivity?: () => void;
     onCheckpointStall?: (stalledMs: number, conversationId: string | null) => void;
+    onUnsafeLocalTool?: (reason: string, conversationId: string | null) => void;
 }): AgyTranscriptWatcherHandle {
     let offset = 0;
     let transcriptPath: string | null = null;
@@ -214,6 +216,11 @@ export function startAgyTranscriptWatcher(options: {
             const delta = readTranscriptDelta(transcriptPath, offset);
             offset = delta.offset;
             for (const line of delta.lines) {
+                const unsafeReason = detectUnsafeAgyLocalToolRequest(line);
+                if (unsafeReason) {
+                    options.onUnsafeLocalTool?.(unsafeReason, conversationId);
+                    return;
+                }
                 const rowType = transcriptRowType(line);
                 if (rowType === 'CHECKPOINT') {
                     checkpointSeenAt = Date.now();

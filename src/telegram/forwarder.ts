@@ -53,6 +53,26 @@ export function chunkTelegramMessage(text: string, limit = 4096) {
     return chunks;
 }
 
+function basenameForDisplay(rawPath: string) {
+    const decoded = rawPath
+        .replace(/^file:\/\//, '')
+        .replace(/%20/g, ' ')
+        .replace(/[?#].*$/, '');
+    const parts = decoded.split(/[\\/]+/).filter(Boolean);
+    return parts[parts.length - 1] || 'local-file';
+}
+
+export function sanitizeTelegramVisibleText(text: string) {
+    let next = String(text || '');
+    next = next.replace(/\[([^\]\n]+)\]\(file:\/\/\/[^)\s]+?\)/g, (_m, label: string) => {
+        const display = label.trim() || 'local-file';
+        return `\`${display}\``;
+    });
+    next = next.replace(/file:\/\/\/[^\s)\]]+/g, (match) => `\`${basenameForDisplay(match)}\``);
+    next = next.replace(/(?<![\w`])\/home\/test\/[^\s)\]]+/g, (match) => `\`${basenameForDisplay(match)}\``);
+    return next;
+}
+
 /**
  * Listener lifecycle helper used by telegram bridge and unit tests.
  * Ensures attach/detach idempotency so re-init does not leak listeners.
@@ -122,10 +142,11 @@ export function createTelegramForwarder({
         const chatId = typeof getLastChatId === 'function' ? getLastChatId() : null;
         if (!chatId) return;
 
-        const preview = String(data["text"]).slice(0, 200).replace(/\n/g, ' ');
+        const visibleText = sanitizeTelegramVisibleText(String(data["text"]));
+        const preview = visibleText.slice(0, 200).replace(/\n/g, ' ');
         log({ chatId, preview });
 
-        const html = markdownToTelegramHtml(String(data["text"]));
+        const html = markdownToTelegramHtml(visibleText);
         const chunks = chunkTelegramMessage(html);
         for (const chunk of chunks) {
             Promise.resolve(

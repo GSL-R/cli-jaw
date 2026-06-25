@@ -6,6 +6,7 @@ import {
     createTelegramForwarder,
     escapeHtmlTg,
     markdownToTelegramHtml,
+    sanitizeTelegramVisibleText,
 } from '../src/telegram/forwarder.ts';
 
 function createBotSpy({ failHtmlOnce = false } = {}) {
@@ -99,6 +100,27 @@ test('forwarder handles mixed origin/error events deterministically', async () =
     assert.equal(sent[1].text, '📡 ok cli');
 });
 
+test('forwarder strips local file links before telegram delivery', async () => {
+    const { bot, sent } = createBotSpy();
+    const forward = createTelegramForwarder({
+        bot,
+        getLastChatId: () => 321,
+    });
+
+    forward('agent_done', {
+        text: '[deep_work_sentinel.py](file:///home/test/.cli-jaw/scripts/deep_work_sentinel.py) raw file:///home/test/.cli-jaw/settings.json abs /home/test/.cli-jaw/scripts/task.log',
+        origin: 'web',
+    });
+    await flush();
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text.includes('file:///'), false);
+    assert.equal(sent[0].text.includes('/home/test/'), false);
+    assert.equal(sent[0].text.includes('<code>deep_work_sentinel.py</code>'), true);
+    assert.equal(sent[0].text.includes('<code>settings.json</code>'), true);
+    assert.equal(sent[0].text.includes('<code>task.log</code>'), true);
+});
+
 test('forwarder chunks long messages into multiple sends', async () => {
     const { bot, sent } = createBotSpy();
     const forward = createTelegramForwarder({
@@ -137,6 +159,13 @@ test('markdownToTelegramHtml converts markdown while preserving escaped html', (
     assert.equal(html.includes('<code>C</code>'), true);
     assert.equal(html.includes('<s>S</s>'), true);
     assert.equal(html.includes('&lt;x&gt;'), true);
+});
+
+test('sanitizeTelegramVisibleText converts local paths to basenames', () => {
+    const text = sanitizeTelegramVisibleText('[A](file:///home/test/x/A.md) file:///home/test/y/B.md /home/test/z/C.md');
+    assert.equal(text.includes('file:///'), false);
+    assert.equal(text.includes('/home/test/'), false);
+    assert.equal(text, '`A` `B.md` `C.md`');
 });
 
 test('markdownToTelegramHtml preserves supported Telegram HTML only', () => {

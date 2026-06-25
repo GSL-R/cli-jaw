@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
     agyTranscriptStepKey,
     classifyAgyTranscriptRow,
+    detectUnsafeAgyLocalToolRequest,
     resolveAgyTranscriptPathForCurrentTurn,
     parseTranscriptLine,
     readTranscriptDelta,
@@ -193,7 +194,38 @@ test('AGY-TR-017: ERROR_MESSAGE is provider error evidence, not a transcript too
     assert.equal(parseTranscriptLine(line), null);
 });
 
-test('AGY-TR-018: malformed ERROR_MESSAGE rows classify safely', () => {
+test('AGY-TR-019: unsafe AGY broad local search is detectable before long stalls', () => {
+    assert.match(detectUnsafeAgyLocalToolRequest(JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [{
+            name: 'grep_search',
+            args: { SearchPath: '"/home/test"', Query: '"deep_work"' },
+        }],
+    })) ?? '', /unsafe AGY grep_search scope/);
+    assert.match(detectUnsafeAgyLocalToolRequest(JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [{
+            name: 'grep_search',
+            args: { SearchPath: '"/home/test/.cli-jaw"', Query: '"hb_ac_guard"' },
+        }],
+    })) ?? '', /unsafe AGY grep_search scope/);
+    assert.match(detectUnsafeAgyLocalToolRequest(JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [{
+            name: 'run_command',
+            args: { CommandLine: '"find /home/test -name \\"*.py\\" | grep -v ima2-gen"' },
+        }],
+    })) ?? '', /broad home search/);
+    assert.equal(detectUnsafeAgyLocalToolRequest(JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [{
+            name: 'grep_search',
+            args: { SearchPath: '"/home/test/.cli-jaw/scripts/deep_work_sentinel.py"', Query: '"air_circulator"' },
+        }],
+    })), null);
+});
+
+test('AGY-TR-020: malformed ERROR_MESSAGE rows classify safely', () => {
     const row = classifyAgyTranscriptRow(JSON.stringify({
         type: 'ERROR_MESSAGE',
         error_code: { nested: true },
