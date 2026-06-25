@@ -245,7 +245,7 @@ async function runHeartbeatJob(job: Record<string, any>) {
         const now = formatHeartbeatNow(schedule);
         const goalPrompt = getGoalContinuationPrompt();
         const goalSection = goalPrompt ? `\n\n--- Active Goal ---\n${goalPrompt}\n--- End Goal ---\n` : '';
-        const prompt = `[heartbeat:${job["name"]}] 현재 시간: ${now} (${timeZone})\n\nBefore responding, you MUST search memory (cli-jaw memory search) for recent conversation context, user preferences, and ongoing tasks. Use this context to ground your response.${goalSection}\n\n${job["prompt"] || '정기 점검입니다. 할 일 없으면 [SILENT]로 응답.'}`;
+        const prompt = `[heartbeat:${job["name"]}] 현재 시간: ${now} (${timeZone})\n\nHeartbeat task rule: run the job's explicit script or narrow task first. Do not perform startup self-audit, provider config inspection, broad file search, or memory search unless the job itself needs historical context and no canonical tool/path is available.${goalSection}\n\n${job["prompt"] || '정기 점검입니다. 할 일 없으면 [SILENT]로 응답.'}`;
         console.log(`[heartbeat:${job["name"]}] tick (${describeHeartbeatSchedule(schedule)})`);
         const requestId = crypto.randomUUID();
         const runResult = isEmployeeHeartbeat(job)
