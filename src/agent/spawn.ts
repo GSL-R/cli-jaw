@@ -733,6 +733,16 @@ function cleanupEmployeeTmpDir(cwd: string, workingDir: string, label: string) {
 
 const AGY_INLINE_PROMPT_BYTE_LIMIT = 12000;
 const AGY_PROMPT_FALLBACK_TEXT = 'Continue using the workspace instructions and proceed with the task.';
+const AGY_SPILL_RUNTIME_BOOTSTRAP = [
+    '[Critical cli-jaw runtime bootstrap]',
+    'You are Arona, the user\'s companion agent. The provider/backend identity is only an implementation detail.',
+    'Speak to the user warmly as Arona in Korean 해요체 unless the user asks otherwise. Keep task reports concise, but do not fall back to a generic formal assistant voice.',
+    'Use the workspace AGENTS.md/CONTEXT.md as your detailed operating rules. If those files are unavailable or unclear, still preserve this Arona identity and channel boundary.',
+    'Telegram boundary: never expose file:// links or absolute /home/test paths; mention only basenames when needed.',
+    'Search boundary: do not list or search /, /home/test, or the whole .cli-jaw tree. Prefer one memory search or exact known files/narrow directories.',
+    'Memory boundary: if the event is meaningful, record it with the configured diary/memory tools before claiming it was recorded.',
+    '---',
+].join('\n');
 
 function prepareAgyPromptWorkspace(bundleText: string, currentPrompt: string, workingDir: string, label: string): { cwd: string; prompt: string } {
     const tmpDir = join(os.tmpdir(), `jaw-agy-prompt-${label}-${Date.now()}-${crypto.randomUUID()}`);
@@ -753,9 +763,10 @@ function prepareAgyPromptWorkspace(bundleText: string, currentPrompt: string, wo
     }
 
     console.log(`[jaw:${label}] AGY prompt spilled to workspace files → ${tmpDir}`);
-    const promptForArg = Buffer.byteLength(currentPrompt, 'utf8') <= AGY_INLINE_PROMPT_BYTE_LIMIT
-        ? currentPrompt
-        : AGY_PROMPT_FALLBACK_TEXT;
+    const promptWithBootstrap = `${AGY_SPILL_RUNTIME_BOOTSTRAP}\n${currentPrompt}`;
+    const promptForArg = Buffer.byteLength(promptWithBootstrap, 'utf8') <= AGY_INLINE_PROMPT_BYTE_LIMIT
+        ? promptWithBootstrap
+        : `${AGY_SPILL_RUNTIME_BOOTSTRAP}\n${AGY_PROMPT_FALLBACK_TEXT}`;
     return { cwd: tmpDir, prompt: promptForArg };
 }
 
