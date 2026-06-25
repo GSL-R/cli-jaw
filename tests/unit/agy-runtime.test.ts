@@ -145,7 +145,9 @@ test('AGY-RT-017: AGY spill prompt keeps critical Arona bootstrap in argv prompt
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     assert.match(spawnSrc, /AGY_SPILL_RUNTIME_BOOTSTRAP/);
     assert.match(spawnSrc, /You are Arona/);
-    assert.match(spawnSrc, /promptWithBootstrap/);
+    assert.match(spawnSrc, /buildAgySpillArgPrompt/);
+    assert.match(spawnSrc, /Current Task Prompt/);
+    assert.match(spawnSrc, /utf8TruncateMiddle\(currentPrompt/);
     assert.match(spawnSrc, /Telegram boundary/);
     assert.match(spawnSrc, /Search boundary/);
 });
