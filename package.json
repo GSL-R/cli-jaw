@@ -1,6 +1,6 @@
 {
   "name": "cli-jaw",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Personal AI assistant powered by Pi, Antigravity, AI-E, Claude, Claude E, Codex, Codex App, Cursor, Gemini, Grok, Kiro, OpenCode, and Copilot — Web, Terminal, Telegram, and Discord interfaces with 107 built-in skills",
   "type": "module",
   "keywords": [
@@ -66,11 +66,11 @@
     "pretest:all": "npm run ensure:native",
     "pretest:integration": "npm run ensure:native",
     "pretest:smoke": "npm run ensure:native",
-    "test": "tsx --import ./tests/setup/test-home.ts --experimental-test-module-mocks --test tests/*.test.ts tests/unit/*.test.ts",
-    "test:all": "tsx --import ./tests/setup/test-home.ts --experimental-test-module-mocks --test tests/*.test.ts tests/**/*.test.ts",
+    "test": "tsx --experimental-test-module-mocks tests/run.mts",
+    "test:all": "tsx --experimental-test-module-mocks tests/run.mts --all",
     "test:integration": "tsx --experimental-test-module-mocks --test tests/integration/*.test.ts",
-    "test:coverage": "tsx --import ./tests/setup/test-home.ts --experimental-test-module-mocks --test --experimental-test-coverage tests/*.test.ts tests/**/*.test.ts",
-    "test:watch": "tsx --import ./tests/setup/test-home.ts --test --watch tests/*.test.ts tests/unit/*.test.ts",
+    "test:coverage": "tsx --experimental-test-module-mocks --experimental-test-coverage tests/run.mts --all",
+    "test:watch": "tsx --experimental-test-module-mocks tests/run.mts --watch",
     "test:web-ui-runtime": "tsx --import ./tests/setup/test-home.ts --experimental-test-module-mocks --test tests/unit/web-ui-runtime-*.test.ts tests/unit/web-ui-processblock-runtime.test.ts tests/unit/web-ui-mermaid-runtime.test.ts tests/unit/web-ui-sanitizer.test.ts tests/unit/web-ui-build-output-guard.test.ts",
     "test:events": "tsx --test tests/events.test.ts",
     "test:telegram": "tsx --test tests/telegram-forwarding.test.ts",
@@ -79,6 +79,7 @@
     "smoke:opencode": "tsx scripts/smoke/opencode-external-dir-smoke.ts",
     "smoke:jwc:no-global": "node scripts/jwc-no-global-smoke.mjs",
     "test:install-risk": "node scripts/install-risk-gate.mjs",
+    "test:waf": "WAF_TEST_ENABLED=1 npx tsx tests/waf/waf-runner.ts",
     "verify:fresh-install": "bash scripts/verify-fresh-install.sh",
     "collect:fresh-install-evidence": "bash scripts/collect-fresh-install-evidence.sh",
     "audit:fresh-install-evidence": "node scripts/audit-fresh-install-evidence.mjs",
@@ -173,7 +174,6 @@
     "yaml": "^2.8.4"
   },
   "optionalDependencies": {
-    "@bitkyc08/ai-e": "latest",
     "claude-e": "latest"
   },
   "devDependencies": {

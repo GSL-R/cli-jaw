@@ -6,9 +6,11 @@
 import { getOrcState, setOrcState, resetOrcState, resetAllOrcStates, deleteNonDefaultOrcStates } from '../core/db.js';
 import { broadcast } from '../core/bus.js';
 import { readLatestWorklog } from '../memory/worklog.js';
+import { checkAttestationGate } from './attestation.js';
 import type { RemoteTarget } from '../messaging/types.js';
 import type { ResolvedSelection } from './parser.js';
 import type { Seed } from './seed.js';
+import type { PhaseAttestation } from './attestation.js';
 
 // ─── Types ──────────────────────────────────────────
 
@@ -70,6 +72,8 @@ export interface OrcContext {
   verificationStatus?: VerificationVerdict;
   userApproved?: boolean;
   projectDirs?: string[] | null;
+  // ─── Phase 60: evidence gate (fallback only; --attest is the gate SOT) ──
+  pendingAttestation?: PhaseAttestation | null;
   // ─── Interview state (P1-1: Evidence-Ref) ────────
   interview?: {
     request: string;
@@ -190,7 +194,8 @@ User says:`,
 
   Pb2: `[PLANNING MODE — User Feedback]
 The user has reviewed your plan. Apply their feedback and present the revised plan.
-If user explicitly approves, run \`cli-jaw orchestrate A\` to advance.
+If user explicitly approves, advance with evidence:
+\`cli-jaw orchestrate A --attest '{"from":"P","to":"A","did":"<the plan you wrote>"}'\`.
 Otherwise revise and present again.
 
 ⛔ STOP after presenting the revision. WAIT for another user response.
@@ -212,7 +217,8 @@ User says:`,
 Below are the plan audit results from the verification employee.
 If issues found: fix the plan and re-audit (output employee JSON again).
 If PASS: report results to the user and wait for approval.
-When user approves, run \`cli-jaw orchestrate B\` to advance to Build.
+When user approves, advance with evidence:
+\`cli-jaw orchestrate B --attest '{"from":"A","to":"B","did":"<who audited + verdict>"}'\`.
 
 Reporting: distill the verdict and key findings into a concise bullet list (≤5 items).
 Use a diagram when the audit covers 3+ files or integration points.
@@ -226,7 +232,8 @@ Employee results:`,
 Below are verification results for your code.
 If NEEDS_FIX: fix and re-verify (output employee JSON again).
 If DONE: report results to the user and wait for approval.
-When user approves, run \`cli-jaw orchestrate C\` to advance to Check.
+When user approves, advance with evidence:
+\`cli-jaw orchestrate C --attest '{"from":"B","to":"C","did":"<what you built + verifier verdict>"}'\`.
 
 Reporting: distill the verdict and key findings into a concise bullet list (≤5 items).
 Use a diagram when the verification covers 3+ files.
@@ -236,6 +243,25 @@ Do NOT paste the full employee output verbatim.
 
 Employee results:`,
 };
+
+function compactLine(value: unknown, max = 700): string {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+export function buildScopeRebindGuard(ctx?: OrcContext | null): string {
+  const parentGoal = compactLine(ctx?.originalPrompt);
+  const interviewPurpose = compactLine(ctx?.interview?.request);
+  if (!parentGoal || !ctx?.interview) return '';
+  return [
+    '## Scope Rebind Guard',
+    `Parent Goal: ${parentGoal}`,
+    interviewPurpose && interviewPurpose !== parentGoal ? `Interview Purpose: ${interviewPurpose}` : '',
+    '- Bind interview answers only as parameters, constraints, success criteria, or wording choices for the Parent Goal.',
+    '- Do not reinterpret a clarification answer as a new parent task or feature.',
+    '- If an answer appears to request a new goal, stop and ask whether to split it into a separate IPABCD/PABCD flow.',
+  ].filter(Boolean).join('\n');
+}
 
 export function getPrefix(state: OrcStateName, source: 'user' | 'worker' = 'user', ctx?: OrcContext | null): string | null {
   if (state === 'I') {
@@ -254,7 +280,10 @@ export function getPrefix(state: OrcStateName, source: 'user' | 'worker' = 'user
     }
     return prefix;
   }
-  if (state === 'P') return PREFIXES["Pb2"]!;
+  if (state === 'P') {
+    const guard = buildScopeRebindGuard(ctx);
+    return guard ? `${PREFIXES["Pb2"]!}\n\n${guard}` : PREFIXES["Pb2"]!;
+  }
   if (state === 'A') return source === 'worker' ? PREFIXES["Ab2"]! : PREFIXES["Ap"]!;
   if (state === 'B' && source === 'worker') return PREFIXES["Bb2"]!;
   return null;
@@ -365,7 +394,14 @@ Suggest planning when ALL of these hold:
 When ready: Summarize known facts (grouped by dimension), remaining unknowns, risky assumptions.
 Then suggest: "Ready for planning. Run \`cli-jaw orchestrate P\` to proceed."
 
-The user can exit anytime: \`orchestrate reset\` (→ IDLE) or \`orchestrate P\` (→ Planning).`,
+The user can exit anytime: \`orchestrate reset\` (→ IDLE) or \`orchestrate P\` (→ Planning).
+
+## Loop / Multi-Pass Tasks
+
+If the user's request contains "loop" / "루프" (or clearly describes work too large for one PABCD cycle), treat it as a MULTI-PASS task:
+- Assume PABCD will run several full cycles — one per work-phase.
+- An Interview output may be a devlog scaffold: the work-phase decomposition (slice map) and per-phase stub docs using decade numbering (10_phase1, 20_phase2, ...), so the structure is agreed before P.
+- A loop may open with a design-only PABCD pass (Phase 0): a code-free whole-system design/documentation cycle that runs before the first implementation work-phase. Note this possibility to the user when the task warrants it.`,
 
   P: `[PABCD — P: PLANNING]
 
@@ -378,6 +414,7 @@ Steps:
 2. Write the complete plan internally:
    - Diff-level precision: exact file paths (NEW/MODIFY/DELETE), before/after diffs for MODIFY, complete content for NEW.
    - Save to a devlog plan file using Jawdev decade numbering (see dev-pabcd skill).
+   - For a loop / multi-pass task: pre-plan the FULL work-phase slice map up front and scaffold per-phase stub docs (10_phase1, 20_phase2, ...). The first pass MAY be a design-only PABCD pass (Phase 0) whose build output is documentation/architecture, not code.
 3. Present to the user in chat:
    - Part 1: Easy, non-developer explanation of what will change and why (≤5 sentences).
    - A Mermaid/SVG diagram showing the file change map.
@@ -385,7 +422,10 @@ Steps:
 4. Final confirmation: "혼자 결정하면 안 되는 비즈니스 로직이 있나요?" and "이 방향이 맞습니까?"
 
 ⛔ STOP. WAIT for user approval before advancing.
-⛔ When approved, run: \`cli-jaw orchestrate A\`
+⛔ When approved, advance WITH an evidence attestation (the forward gate requires it):
+\`\`\`bash
+cli-jaw orchestrate A --attest '{"from":"P","to":"A","did":"<one sentence: the concrete plan you wrote — files/surfaces + the devlog path>"}'
+\`\`\`
 
 You will receive user feedback with a [PLANNING MODE] prefix. Revise until approved.
 
@@ -429,7 +469,10 @@ The result is returned via stdout. Review it:
 - If PASS: report results to the user.
 
 ⛔ STOP after reporting. WAIT for user approval.
-⛔ When user approves, run: \`cli-jaw orchestrate B\``,
+⛔ When user approves, advance WITH an evidence attestation (the forward gate requires it):
+\`\`\`bash
+cli-jaw orchestrate B --attest '{"from":"A","to":"B","did":"<one sentence: who audited the plan + the verdict (PASS / fixed N issues)>"}'
+\`\`\``,
 
   B: `[PABCD — B: BUILD]
 
@@ -472,7 +515,10 @@ Review the stdout result:
 - DONE: Report results to the user.
 
 ⛔ STOP after reporting. WAIT for user approval.
-⛔ When user approves, run: \`cli-jaw orchestrate C\``,
+⛔ When user approves, advance WITH an evidence attestation (the forward gate requires it):
+\`\`\`bash
+cli-jaw orchestrate C --attest '{"from":"B","to":"C","did":"<one sentence: what you built + who verified it + the verdict>"}'
+\`\`\``,
 
   C: `[PABCD — C: CHECK + SCRUTINY]
 
@@ -508,14 +554,19 @@ IF Seed exists:
   - Empty evidence = NOT MET.
 
 **Stage 3: Verdict**
-- All passed → RUN \`cli-jaw orchestrate D\` now. Do not merely suggest it or write "C → D"; execute the command before claiming C is complete.
+- All passed → RUN \`cli-jaw orchestrate D --attest\` now (C→D uniquely requires a pasted command
+  tail — a plain \`cli-jaw orchestrate D\` or narration alone will NOT pass the gate):
+  \`\`\`bash
+  cli-jaw orchestrate D --attest '{"from":"C","to":"D","did":"<what you checked>","checkOutput":"<paste the real tail of tsc/test output>","exitCode":0}'
+  \`\`\`
+  Do not merely suggest it or write "C → D"; execute the command before claiming C is complete.
 - Code issue → suggest \`cli-jaw orchestrate B\`
 - Plan issue (AC not met) → suggest \`cli-jaw orchestrate P\`
 - Spec issue (wrong requirements) → suggest \`cli-jaw orchestrate I\``,
 
   D: `[PABCD — D: DONE + WONDER/REFLECT]
 
-All phases finished. Summarize what was accomplished:
+This PABCD cycle is finished. Summarize what was accomplished in this work-phase:
 1. Files changed (list)
 2. Which acceptance criteria were met (if Seed exists)
 
@@ -534,9 +585,10 @@ Then perform two reflections:
 
 Present findings to user. Then:
 - If significant issues: "Seed를 개선하려면: \`cli-jaw orchestrate I\`"
+- If a goal is active and the objective still has remaining work-phases: this cycle's D closes the current work-phase; start the next one with \`cli-jaw orchestrate P\` (the legal path is D → IDLE → P). Do not declare the whole goal done yet.
 - Otherwise: "완료. D 단계까지 실행했고 오케스트레이션을 마무리했습니다."
 
-Returning to idle after D.`,
+Returning to idle after D (next work-phase, if any, re-enters at P).`,
 };
 
 export function getStatePrompt(target: string): string {
@@ -560,10 +612,24 @@ export interface TransitionResult {
   reason?: string;
 }
 
+/**
+ * Actor + evidence input for a gated transition (Phase 60: evidence gate).
+ * Omitting `gate` entirely keeps the legacy human behavior (back-compat for the
+ * many existing 3-arg call sites). `actor:'agent'` switches to the FORM-ONLY
+ * attestation gate for all forward transitions; humans keep the free pass.
+ */
+export interface GateInput {
+  actor?: 'agent' | 'human';
+  attestation?: PhaseAttestation | null;
+  /** Hidden emergency override — only honored for the agent path. */
+  force?: boolean;
+}
+
 export function canTransition(
   from: OrcStateName,
   to: OrcStateName,
   ctx?: OrcContext | null,
+  gate?: GateInput,
 ): TransitionResult {
   if (!VALID_TRANSITIONS[from]?.includes(to)) {
     return { ok: false, reason: `Invalid transition: ${from} → ${to}. Force cannot skip phases; start from the next valid phase.` };
@@ -576,6 +642,16 @@ export function canTransition(
   if (from === 'I' && to === 'P' && !ctx?.interview) {
     console.warn('[jaw:pabcd] I→P without interview context — proceeding anyway');
   }
+
+  // Phase 60: AGENT path — FORM-ONLY evidence gate on the 4 forward transitions.
+  // The agent cannot advance by heuristic narration; it must submit a well-formed
+  // <phase_attestation> (via --attest). Hidden --force is the only override.
+  if (gate?.actor === 'agent') {
+    if (gate.force) return { ok: true };
+    return checkAttestationGate(from, to, gate.attestation ?? null);
+  }
+
+  // HUMAN / legacy path (no gate, or actor!=='agent'): keep the pre-Phase-60 behavior.
   // Phase 58: Gate A→B on audit verdict (strict equality, not truthy).
   if (from === 'A' && to === 'B') {
     if (ctx?.userApproved) return { ok: true };

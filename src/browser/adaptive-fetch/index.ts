@@ -1,30 +1,8 @@
-// Mirrored from agbrowse adaptive-fetch v2; keep runtime behavior aligned while cli-jaw mirror remains experimental.
-
-import type { AdaptiveFetchOptions, BrowserMode, IdentityMode, CandidateUrl, ReaderCandidate, ChallengeInfo, AttemptTrace } from './types.js';
+import type { AdaptiveFetchOptions, BrowserMode, IdentityMode } from './types.js';
 import { parseArgs } from 'node:util';
-import { validateFetchUrl, DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS } from './safety.js';
-import { appendAttempt, createAttemptTrace, summarizeAttempts } from './trace.js';
-import { resolvePublicEndpointCandidates } from './endpoint-resolvers.js';
-import { fetchTextCandidate } from './fetcher.js';
-import { fromFetchResult, fromUserSessionResult, fromHumanResolvedResult } from './reader-adapters.js';
-import { chooseBestReaderCandidate, scoreReaderCandidate } from './content-scorer.js';
-import { fetchThirdPartyReaderCandidate } from './third-party-readers.js';
-import {
-    collectBrowserMetadataCandidate,
-    collectBrowserStructuredResultCandidates,
-    collectDefuddleCandidate,
-    collectNetworkJsonCandidates,
-} from './browser-escalation.js';
-import { tryBrowserEscalation } from './browser-flow.js';
-import { fromBrowserResult, fromMetadataResult, fromNetworkCandidate } from './reader-adapters.js';
-import { classifyChallengeType } from './challenge-detector.js';
-import { shouldTryUserSession, navigateInUserSession } from './browser-session.js';
-import { humanResolve } from './human-loop.js';
+import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS } from './safety.js';
+import { executeAdaptiveFetch } from './scheduler.js';
 import { compactAdaptiveFetchResult, writeStdoutLine } from './output.js';
-
-// @strict-allow-any(mirrored adaptive-fetch scorer result shape is intentionally duck-typed)
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ScoredResult = any;
 
 const BROWSER_MODES = new Set(['auto', 'never', 'required']);
 const BROWSER_SESSIONS = new Set(['none', 'isolated', 'existing', 'user', 'interactive']);
@@ -37,7 +15,7 @@ export function normalizeAdaptiveFetchOptions(raw: Record<string, unknown> = {})
     const identity = normalizeEnum(raw['identity'], IDENTITY_MODES, 'auto', 'identity') as IdentityMode;
     const userSessionExplicit = browserSession === 'user' || browserSession === 'interactive';
     const humanLoop = browserSession === 'interactive';
-    return {
+    const result: AdaptiveFetchOptions = {
         url: typeof raw['url'] === 'string' ? raw['url'] : '',
         json: Boolean(raw['json']),
         trace: Boolean(raw['trace']),
@@ -57,284 +35,16 @@ export function normalizeAdaptiveFetchOptions(raw: Record<string, unknown> = {})
         interactive: Boolean(raw['interactive']),
         optionWarnings: raw['allowArchive'] ? ['archive-fallback-deferred'] : [],
     };
+    if (typeof raw['query'] === 'string' && raw['query']) result.query = raw['query'];
+    if (typeof raw['proxy'] === 'string' && raw['proxy']) result.proxy = raw['proxy'];
+    return result;
 }
 
 export async function runAdaptiveFetch(input: Record<string, unknown>, deps: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const options = normalizeAdaptiveFetchOptions(input);
-    const trace = createAttemptTrace({
-        url: options.url,
-        browserMode: options.browserMode,
-        browserSession: options.browserSessionRaw || options.browserSession,
-    });
     const fetchImpl = (deps['fetch'] || input['fetchImpl']) as typeof fetch | undefined;
-    const fetchOpt = fetchImpl ? { fetchImpl } : {};
-    const parsed = validateFetchUrl(options.url, { allowPrivateNetwork: options.allowPrivateNetwork });
-    appendAttempt(trace, {
-        source: 'validation',
-        verdict: 'weak_ok',
-        url: parsed.href,
-        reason: 'url-valid',
-    });
-
-    const candidateUrls: CandidateUrl[] = [];
-    if (options.browserMode !== 'required' && options.publicEndpoints) {
-        candidateUrls.push(...resolvePublicEndpointCandidates(parsed).map(candidate => ({
-            ...candidate,
-            source: 'public_endpoint',
-        })));
-    }
-    if (options.browserMode !== 'required') {
-        candidateUrls.push({ label: 'direct-fetch', url: parsed.href, source: 'fetch' });
-    }
-
-    const readerCandidates: ReaderCandidate[] = [];
-    const fetchedUrls = new Set<string>();
-    const discoveredFeedUrls: string[] = [];
-    const discoveredOembedUrls: string[] = [];
-    let detectedChallenge: ChallengeInfo | null = null;
-
-    for (const candidate of candidateUrls) {
-        let fetched: Record<string, unknown>;
-        try {
-            fetched = await fetchTextCandidate(candidate.url, {
-                maxBytes: options.maxBytes,
-                timeoutMs: options.timeoutMs,
-                allowPrivateNetwork: options.allowPrivateNetwork,
-                identity: options.identity,
-                ...fetchOpt,
-            }) as unknown as Record<string, unknown>;
-        } catch (error: unknown) {
-            appendAttempt(trace, {
-                source: candidate.source,
-                verdict: 'error',
-                url: candidate.url,
-                reason: (error as Error).message || 'fetch-candidate-error',
-            });
-            continue;
-        }
-        fetchedUrls.add((fetched['finalUrl'] as string) || candidate.url);
-
-        if (candidate.source === 'fetch' && !fetched['ok']) {
-            const challengeResult = classifyChallengeType({
-                status: fetched['status'] as number,
-                headers: fetched['headers'] as Record<string, string>,
-                body: fetched['text'] as string,
-            });
-            if (challengeResult.type) {
-                detectedChallenge = challengeResult as unknown as ChallengeInfo;
-                appendAttempt(trace, {
-                    source: candidate.source,
-                    verdict: challengeResult.type,
-                    url: fetched['finalUrl'] as string,
-                    status: fetched['status'] as number,
-                    reason: `challenge:${challengeResult.type}`,
-                });
-            }
-        }
-
-        const readerCandidate = fromFetchResult(fetched, {
-            source: candidate.source,
-            label: candidate.label,
-        });
-        if (detectedChallenge && candidate.source === 'fetch') {
-            readerCandidate.challenge = detectedChallenge;
-        }
-        const metadata = readerCandidate.metadata;
-        for (const feedUrl of ((metadata as Record<string, unknown> | null)?.['feedUrls'] as string[]) || []) {
-            if (!fetchedUrls.has(feedUrl) && !discoveredFeedUrls.includes(feedUrl)) discoveredFeedUrls.push(feedUrl);
-        }
-        for (const oEmbedUrl of ((metadata as Record<string, unknown> | null)?.['oEmbedUrls'] as string[]) || []) {
-            if (!fetchedUrls.has(oEmbedUrl) && !discoveredOembedUrls.includes(oEmbedUrl)) discoveredOembedUrls.push(oEmbedUrl);
-        }
-        const scored = scoreReaderCandidate(readerCandidate);
-        appendAttempt(trace, {
-            source: readerCandidate.source,
-            verdict: scored.verdict,
-            url: fetched['finalUrl'] as string,
-            status: fetched['status'] as number,
-            reason: `score:${scored.score}`,
-        });
-        if (readerCandidate.text || readerCandidate.title) readerCandidates.push(readerCandidate);
-    }
-
-    if (options.browserMode !== 'required' && options.publicEndpoints) {
-        for (const discovered of [
-            ...discoveredFeedUrls.map(url => ({ url, label: 'rss-atom-discovered' })),
-            ...discoveredOembedUrls.map(url => ({ url, label: 'oembed-discovered' })),
-        ]) {
-            let fetched: Record<string, unknown>;
-            try {
-                fetched = await fetchTextCandidate(discovered.url, {
-                    maxBytes: options.maxBytes,
-                    timeoutMs: options.timeoutMs,
-                    allowPrivateNetwork: options.allowPrivateNetwork,
-                    identity: options.identity,
-                    ...fetchOpt,
-                }) as unknown as Record<string, unknown>;
-            } catch (error: unknown) {
-                appendAttempt(trace, {
-                    source: 'public_endpoint',
-                    verdict: 'error',
-                    url: discovered.url,
-                    reason: (error as Error).message || `${discovered.label}-error`,
-                });
-                continue;
-            }
-            fetchedUrls.add((fetched['finalUrl'] as string) || discovered.url);
-            const readerCandidate = fromFetchResult(fetched, {
-                source: 'public_endpoint',
-                label: discovered.label,
-            });
-            const scored = scoreReaderCandidate(readerCandidate);
-            appendAttempt(trace, {
-                source: readerCandidate.source,
-                verdict: scored.verdict,
-                url: fetched['finalUrl'] as string,
-                status: fetched['status'] as number,
-                reason: `score:${scored.score}`,
-            });
-            if (readerCandidate.text || readerCandidate.title) readerCandidates.push(readerCandidate);
-        }
-    }
-
-    if (options.allowThirdPartyReader) {
-        let fetched: ReaderCandidate | null = null;
-        try {
-            fetched = await fetchThirdPartyReaderCandidate(parsed.href, {
-                allowThirdPartyReader: true,
-                maxBytes: options.maxBytes,
-                timeoutMs: options.timeoutMs,
-                ...fetchOpt,
-            });
-        } catch (error: unknown) {
-            appendAttempt(trace, {
-                source: 'third_party_reader',
-                verdict: 'error',
-                url: parsed.href,
-                reason: (error as Error).message || 'third-party-reader-error',
-            });
-        }
-        if (fetched) {
-            const readerCandidate = fromFetchResult(fetched as unknown as Record<string, unknown>, {
-                source: 'third_party_reader',
-                label: 'jina-reader',
-            });
-            const scored = scoreReaderCandidate(readerCandidate);
-            appendAttempt(trace, {
-                source: readerCandidate.source,
-                verdict: scored.verdict,
-                url: (fetched as unknown as Record<string, unknown>)['readerUrl'] as string || fetched.finalUrl,
-                status: fetched.status,
-                reason: `score:${scored.score}`,
-            });
-            if (readerCandidate.text || readerCandidate.title) readerCandidates.push(readerCandidate);
-        }
-    }
-
-    let best: ScoredResult = chooseBestReaderCandidate(readerCandidates);
-    if (shouldReturnWithoutBrowser(best, options)) return finishResult(resultFromReaderCandidate(best), options, trace);
-
-    const browserResult = await tryBrowserEscalation(parsed.href, options, deps, trace, detectedChallenge);
-    if (browserResult) {
-        readerCandidates.push(fromBrowserResult(browserResult));
-        const metadataCandidate = collectBrowserMetadataCandidate(browserResult);
-        if (metadataCandidate) readerCandidates.push(fromMetadataResult(metadataCandidate));
-        for (const structuredCandidate of collectBrowserStructuredResultCandidates(browserResult)) {
-            readerCandidates.push(fromBrowserResult(structuredCandidate));
-        }
-        const defuddleCandidate = collectDefuddleCandidate(browserResult);
-        if (defuddleCandidate) readerCandidates.push(fromBrowserResult(defuddleCandidate));
-        for (const networkCandidate of collectNetworkJsonCandidates(browserResult)) {
-            readerCandidates.push(fromNetworkCandidate(networkCandidate));
-        }
-        best = chooseBestReaderCandidate(readerCandidates);
-        if (best && best.verdict === 'strong_ok') {
-            const result = resultFromReaderCandidate(best);
-            if (options.userSessionExplicit) {
-                result['safetyFlags'] = [...((result['safetyFlags'] as string[]) || []), 'user_session_used'];
-            }
-            return finishResult(result, options, trace, { chromeUsed: true });
-        }
-    }
-
-    const sessionDecision = shouldTryUserSession(readerCandidates, { ...options, browserDeps: deps });
-    if (sessionDecision === true) {
-        try {
-            const userResult = await navigateInUserSession(parsed.href, {
-                browserDeps: deps,
-                timeoutMs: options.timeoutMs,
-                selector: options.selector,
-                allowPrivateNetwork: options.allowPrivateNetwork,
-            });
-            readerCandidates.push(fromUserSessionResult(userResult as unknown as Record<string, unknown>));
-            appendAttempt(trace, {
-                source: 'browser_user',
-                verdict: 'strong_ok',
-                url: (userResult as unknown as Record<string, unknown>)['finalUrl'] as string,
-                reason: 'user-session-render',
-            });
-            best = chooseBestReaderCandidate(readerCandidates);
-            if (best && best.verdict === 'strong_ok') {
-                return finishResult(resultFromReaderCandidate(best), options, trace, { chromeUsed: true });
-            }
-        } catch (error: unknown) {
-            appendAttempt(trace, {
-                source: 'browser_user',
-                verdict: 'error',
-                url: parsed.href,
-                reason: (error as Error).message || 'user-session-error',
-            });
-        }
-    }
-
-    if (options.humanLoop && hasUnresolvedChallenge(readerCandidates, best)) {
-        const challengeInfo = detectedChallenge || { type: 'challenge' };
-        try {
-            const humanResult = await humanResolve(parsed.href, {
-                ...options,
-                browserDeps: deps,
-            }, challengeInfo) as Record<string, unknown>;
-            if (humanResult['ok'] !== false) {
-                readerCandidates.push(fromHumanResolvedResult(humanResult));
-                appendAttempt(trace, {
-                    source: 'human_resolved',
-                    verdict: 'strong_ok',
-                    url: (humanResult['finalUrl'] as string) || parsed.href,
-                    reason: 'human-resolved',
-                });
-                best = chooseBestReaderCandidate(readerCandidates);
-                if (best) return finishResult(resultFromReaderCandidate(best), options, trace, { chromeUsed: true });
-            } else {
-                appendAttempt(trace, {
-                    source: 'human_resolved',
-                    verdict: (humanResult['verdict'] as string) || 'blocked',
-                    url: parsed.href,
-                    reason: (humanResult['actionMessage'] as string) || 'human-action-needed',
-                });
-            }
-        } catch (error: unknown) {
-            appendAttempt(trace, {
-                source: 'human_resolved',
-                verdict: 'error',
-                url: parsed.href,
-                reason: (error as Error).message || 'human-loop-error',
-            });
-        }
-    }
-
-    if (best) return finishResult(resultFromReaderCandidate(best), options, trace, { chromeUsed: Boolean(browserResult) });
-    return finishResult({
-        ok: false,
-        verdict: options.browserMode === 'required' ? 'browser_required' : 'blocked',
-        source: options.browserMode === 'required' ? 'browser' : 'fetch',
-        finalUrl: parsed.href,
-        title: null,
-        content: '',
-        summary: 'No public endpoint, fetch, or metadata attempt produced readable content.',
-        reason: 'no-readable-content',
-        evidence: [],
-        warnings: [],
-    }, options, trace);
+    const mergedDeps = fetchImpl ? { ...deps, fetch: fetchImpl } : deps;
+    return executeAdaptiveFetch(options, mergedDeps) as unknown as Record<string, unknown>;
 }
 
 export async function runAdaptiveFetchCli(args: string[], deps: Record<string, unknown> = {}): Promise<void> {
@@ -353,8 +63,10 @@ export async function runAdaptiveFetchCli(args: string[], deps: Record<string, u
             'timeout-ms': { type: 'string' },
             selector: { type: 'string' },
             'no-public-endpoints': { type: 'boolean', default: false },
-            'allow-third-party-reader': { type: 'boolean', default: false },
+            'allow-third-party-reader': { type: 'boolean', default: true },
             'allow-archive': { type: 'boolean', default: false },
+            query: { type: 'string' },
+            proxy: { type: 'string' },
             help: { type: 'boolean', short: 'h', default: false },
         },
     });
@@ -375,6 +87,8 @@ export async function runAdaptiveFetchCli(args: string[], deps: Record<string, u
         publicEndpoints: !values['no-public-endpoints'],
         allowThirdPartyReader: values['allow-third-party-reader'],
         allowArchive: values['allow-archive'],
+        query: values['query'],
+        proxy: values['proxy'],
     }, deps);
     if (values.json) {
         const { _traceSummary, ...jsonResult } = result;
@@ -407,7 +121,8 @@ Options:
   --max-bytes N                  Maximum response bytes per read
   --timeout-ms N                 Per-attempt timeout
   --selector CSS                 Browser text extraction selector
-  --allow-third-party-reader     Allow opt-in public reader services
+  --allow-third-party-reader     Use Jina Reader as fallback (default: on)
+  --no-allow-third-party-reader  Disable Jina Reader fallback
   --no-public-endpoints          Skip known public endpoint resolvers
   --allow-archive                Accepted but deferred; emits a warning
 `;
@@ -434,60 +149,4 @@ function normalizeEnum(value: unknown, allowed: Set<string>, fallback: string, n
 function positiveInteger(value: unknown, fallback: number): number {
     const n = Number(value);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
-}
-
-function resultFromReaderCandidate(scored: ScoredResult): Record<string, unknown> {
-    const candidate = scored.candidate as ReaderCandidate;
-    return {
-        ok: candidate.ok !== false && ['strong_ok', 'weak_ok'].includes(scored.verdict as string),
-        verdict: scored.verdict,
-        source: candidate.source,
-        finalUrl: candidate.finalUrl,
-        title: candidate.title || null,
-        content: candidate.text || '',
-        summary: `${candidate.label || candidate.source} selected with ${scored.verdict} (score ${scored.score}).`,
-        reason: `score:${scored.score}`,
-        evidence: scored.evidence,
-        warnings: candidate.warnings || [],
-        safetyFlags: candidate.safetyFlags || [],
-        metadata: candidate.metadata || null,
-    };
-}
-
-function finishResult(result: Record<string, unknown>, options: AdaptiveFetchOptions, trace: AttemptTrace, runtime: { chromeUsed?: boolean } = {}): Record<string, unknown> {
-    return {
-        ok: result['ok'],
-        verdict: result['verdict'],
-        source: result['source'],
-        finalUrl: result['finalUrl'],
-        browserMode: options.browserMode,
-        browserSession: options.browserSessionRaw || options.browserSession,
-        identity: options.identity || 'auto',
-        chromeUsed: Boolean(runtime.chromeUsed),
-        chromeRequired: result['verdict'] === 'browser_required' || (options.browserMode === 'required' && !result['ok']),
-        title: result['title'],
-        content: result['content'],
-        summary: result['summary'],
-        attempts: options.trace ? trace.attempts : [],
-        safetyFlags: Array.isArray(result['safetyFlags']) ? result['safetyFlags'] : [],
-        evidence: (result['evidence'] as unknown[]) || [],
-        warnings: [...(options.optionWarnings || []), ...((result['warnings'] as string[]) || [])],
-        metadata: result['metadata'] || null,
-        _traceSummary: summarizeAttempts(trace.attempts),
-    };
-}
-
-function shouldReturnWithoutBrowser(best: ScoredResult | null, options: AdaptiveFetchOptions): boolean {
-    if (options.browserMode === 'required') return false;
-    if (options.browserMode === 'never') return Boolean(best);
-    return Boolean(best && best.verdict === 'strong_ok');
-}
-
-function hasUnresolvedChallenge(candidates: ReaderCandidate[], best: ScoredResult | null): boolean {
-    if (best && best.verdict === 'strong_ok') return false;
-    return candidates.some(c =>
-        c.challenge?.type === 'challenge' ||
-        c.challenge?.type === 'auth_required' ||
-        c.challenge?.type === 'paywall'
-    ) || (best != null && ['challenge', 'auth_required', 'paywall', 'blocked'].includes(best.verdict as string));
 }

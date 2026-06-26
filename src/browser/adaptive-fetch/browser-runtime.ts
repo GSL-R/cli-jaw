@@ -1,5 +1,3 @@
-// Mirrored from agbrowse adaptive-fetch v2; keep runtime behavior aligned while cli-jaw mirror remains experimental.
-
 export class BrowserRequiredError extends Error {
     code: string;
     constructor(message: string) {
@@ -18,12 +16,25 @@ export async function getFetchBrowserPage(options: { browserDeps?: Record<string
         if (typeof deps['getPage'] !== 'function') throw new BrowserRequiredError('browser getPage dependency is unavailable');
         return { page: await (deps['getPage'] as () => Promise<unknown>)(), cleanup: async () => undefined, isolated: false };
     }
+
     if (typeof deps['createIsolatedPage'] === 'function') {
         return (deps['createIsolatedPage'] as () => Promise<{ page: unknown; cleanup: () => Promise<void>; isolated: boolean }>)();
     }
     throw new BrowserRequiredError('isolated browser page dependency is unavailable');
 }
 
+export async function releaseFetchBrowserPage(pageRef: { page?: unknown; cleanup?: () => Promise<void> | void; isolated?: boolean }): Promise<void> {
+    if (typeof pageRef.cleanup === 'function') await pageRef.cleanup();
+}
+
 export async function closeFetchBrowserPage(pageRef: { cleanup?: () => Promise<void> | void }): Promise<void> {
     if (typeof pageRef?.cleanup === 'function') await pageRef.cleanup();
+}
+
+export async function drainPool(): Promise<void> {
+    // no-op: isolated page pooling removed for state isolation safety
+}
+
+export function getPoolSize(): number {
+    return 0;
 }

@@ -1,5 +1,13 @@
 // bgtask boot recovery — probes resumed, dead children failed+notified,
 // live unowned children orphaned, unnotified terminals re-notified.
+//
+// recoverBgTasks does a GLOBAL sweep (loadRecoverable → all running rows) and
+// this file stubs isAlive to declare every foreign PID dead. Under the shared
+// jaw.db that tests/run.mts hands to every isolation:'process' child, that would
+// clobber in-flight rows owned by other concurrent test files (e.g. bgtask-runner's
+// "exited before completion" task → "lost during server restart"). Import the
+// isolated-home setup FIRST so this file gets its own DB and only sweeps its own rows.
+import '../setup/isolated-home.ts';
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -75,7 +83,7 @@ test('recovery matrix: probe resumed, dead child failed+notified, young live chi
 
     const { calls, submit } = makeSubmitSpy();
     try {
-        const summary = await recoverBgTasks({ submit });
+        const summary = await recoverBgTasks({ submit, isAlive: (pid) => pid === live.pid });
 
         assert.equal(summary.resumedProbes, 1);
         assert.ok(isTaskRunnerActive(probe.id), 'probe runner re-attached');
@@ -107,7 +115,7 @@ test('recovery kills live orphaned child after grace window while preserving fre
 
     const { calls, submit } = makeSubmitSpy();
     try {
-        const summary = await recoverBgTasks({ submit });
+        const summary = await recoverBgTasks({ submit, isAlive: (pid) => pid === live.pid });
 
         assert.equal(summary.failedLost, 1);
         assert.equal(summary.orphaned, 0);

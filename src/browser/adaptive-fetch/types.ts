@@ -24,6 +24,9 @@ export interface AdaptiveFetchOptions {
     allowThirdPartyReader: boolean;
     allowArchive: boolean;
     interactive: boolean;
+    query?: string;
+    proxy?: string;
+    overallTimeoutMs?: number;
     optionWarnings: string[];
 }
 
@@ -35,6 +38,8 @@ export interface FetchTextCandidateOptions {
     fetchImpl?: typeof fetch;
     beforeFetch?: (url: string) => Promise<void> | void;
     identity?: string;
+    proxy?: string;
+    signal?: AbortSignal;
 }
 
 export interface BrowserCandidateOptions {
@@ -44,6 +49,7 @@ export interface BrowserCandidateOptions {
     selector?: string | null;
     allowPrivateNetwork?: boolean;
     challengeInfo?: ChallengeInfo | null;
+    signal?: AbortSignal;
 }
 
 export interface FetchAttempt {

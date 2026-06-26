@@ -1,7 +1,7 @@
 // Mirrored from agbrowse adaptive-fetch v2; keep runtime behavior aligned while cli-jaw mirror remains experimental.
 
 import type { BrowserCandidateOptions } from './types.js';
-import { closeFetchBrowserPage, getFetchBrowserPage } from './browser-runtime.js';
+import { releaseFetchBrowserPage, getFetchBrowserPage } from './browser-runtime.js';
 import { classifyAccessBoundary, detectChallengeMarkers } from './challenge-detector.js';
 import { runDefuddleInPage } from './defuddle-extractor.js';
 import { extractMetadataFromHtml } from './metadata.js';
@@ -19,6 +19,13 @@ export async function collectBrowserCandidate(url: string, options: BrowserCandi
         browserSession: options.browserSession || 'isolated',
     });
     const page: AnyPage = pageRef.page;
+    if (options.signal?.aborted) {
+        await releaseFetchBrowserPage(pageRef);
+        return { source: 'browser', label: 'browser-render', ok: false, status: 0, finalUrl: url, text: '', title: '', evidence: ['deadline-aborted'], warnings: ['deadline-aborted'] };
+    }
+    // P0-6: close the page if the overall deadline fires so a hung page.goto rejects.
+    const onDeadlineAbort = (): void => { try { page.close?.(); } catch { /* page already closing */ } };
+    options.signal?.addEventListener('abort', onDeadlineAbort, { once: true });
     const networkCandidates: Record<string, unknown>[] = [];
     const onResponse = async (response: AnyPage) => {
         try {
@@ -60,7 +67,7 @@ export async function collectBrowserCandidate(url: string, options: BrowserCandi
         }
 
         const challengeInfo = options.challengeInfo;
-        if ((challengeInfo as AnyPage)?.primary?.behavior?.jsChallengeSolvable) {
+        if ((challengeInfo as AnyPage)?.primary?.profile?.behavior?.jsChallengeSolvable) {
             await waitForChallengeResolution(page, 10000);
         } else if (typeof page.waitForTimeout === 'function') {
             await page.waitForTimeout(300).catch(() => undefined);
@@ -145,8 +152,9 @@ export async function collectBrowserCandidate(url: string, options: BrowserCandi
             defuddleCandidate,
         };
     } finally {
+        options.signal?.removeEventListener('abort', onDeadlineAbort);
         if (typeof page.off === 'function') page.off('response', onResponse);
-        await closeFetchBrowserPage(pageRef);
+        await releaseFetchBrowserPage(pageRef);
     }
 }
 

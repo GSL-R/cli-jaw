@@ -2,7 +2,7 @@ import { describe, test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     getState, setState, getCtx, resetState,
-    canTransition, getPrefix, getStatePrompt,
+    canTransition, getPrefix, getStatePrompt, buildScopeRebindGuard,
     type OrcStateName,
 } from '../../src/orchestrator/state-machine.ts';
 
@@ -117,5 +117,120 @@ describe('PABCD state-machine', () => {
         assert.equal(getState('default'), 'I');
         const saved = getCtx('default');
         assert.deepEqual(saved!.interview, ctx.interview);
+    });
+    // --- Loop / multi-pass work-phase prompt contract (devlog 260624_goal_work_phase_pabcd_loop, Slice 6) ---
+    test('26. I prompt has Loop / Multi-Pass section recognizing loop/루프 + Phase 0', () => {
+        const i = getStatePrompt('I');
+        assert.ok(i.includes('Loop / Multi-Pass Tasks'), 'I prompt missing Loop / Multi-Pass section');
+        assert.ok(i.includes('"loop"') && i.includes('"루프"'), 'I prompt must recognize loop/루프 keyword');
+        assert.ok(i.includes('one per work-phase'), 'I prompt must assume one PABCD cycle per work-phase');
+        assert.ok(i.includes('design-only PABCD pass (Phase 0)'), 'I prompt missing design-only Phase 0 mention');
+    });
+    test('27. P prompt pre-plans full slice map + design-only Phase 0 for loop tasks', () => {
+        const p = getStatePrompt('P');
+        assert.ok(p.includes('loop / multi-pass task'), 'P prompt missing loop/multi-pass guidance');
+        assert.ok(p.includes('pre-plan the FULL work-phase slice map'), 'P prompt must pre-plan full slice map');
+        assert.ok(p.includes('design-only PABCD pass (Phase 0)'), 'P prompt missing design-only Phase 0 mention');
+    });
+    test('28. D prompt scopes summary to work-phase, not whole goal', () => {
+        const d = getStatePrompt('D');
+        assert.ok(d.includes('This PABCD cycle is finished'), 'D must scope to the cycle, not "all phases finished"');
+        assert.ok(d.includes('in this work-phase'), 'D summary must be work-phase scoped');
+        assert.ok(!d.includes('All phases finished'), 'D must not declare all phases finished unconditionally');
+    });
+    test('29. D prompt re-enters P for next work-phase when a goal is active', () => {
+        const d = getStatePrompt('D');
+        assert.ok(d.includes('a goal is active'), 'D missing goal-active branch');
+        assert.ok(d.includes('cli-jaw orchestrate P'), 'D must point next work-phase to orchestrate P');
+        assert.ok(d.includes('D → IDLE → P'), 'D must state the legal re-entry path D → IDLE → P');
+        assert.ok(d.includes('Do not declare the whole goal done yet'), 'D must not declare whole goal done after one cycle');
+    });
+
+    // --- Phase 60: agent evidence gate (GateInput) on canTransition ---
+    test('30. agent path: P→A/A→B/B→C/C→D blocked without attestation', () => {
+        for (const [f, t] of [['P', 'A'], ['A', 'B'], ['B', 'C'], ['C', 'D']] as const) {
+            const r = canTransition(f, t, null, { actor: 'agent' });
+            assert.equal(r.ok, false, `agent ${f}→${t} must be blocked without attestation`);
+            assert.match(r.reason!, /attestation|--attest/i);
+        }
+    });
+    test('31. agent path: passes with a well-formed attestation (narrative did)', () => {
+        for (const [f, t] of [['P', 'A'], ['A', 'B'], ['B', 'C']] as const) {
+            const att = { from: f, to: t, did: 'did specific real work this phase', raw: '{}' };
+            assert.equal(canTransition(f, t, null, { actor: 'agent', attestation: att }).ok, true, `agent ${f}→${t}`);
+        }
+    });
+    test('32. agent path: C→D needs checkOutput', () => {
+        const noOut = { from: 'C' as const, to: 'D' as const, did: 'ran checks', raw: '{}' };
+        assert.equal(canTransition('C', 'D', null, { actor: 'agent', attestation: noOut }).ok, false);
+        const withOut = { from: 'C' as const, to: 'D' as const, did: 'ran checks', checkOutput: '49/49 pass', raw: '{}' };
+        assert.equal(canTransition('C', 'D', null, { actor: 'agent', attestation: withOut }).ok, true);
+    });
+    test('33. agent path: hidden --force overrides the gate', () => {
+        assert.equal(canTransition('A', 'B', null, { actor: 'agent', force: true }).ok, true);
+    });
+    test('34. agent path: any→I never requires attestation', () => {
+        assert.equal(canTransition('B', 'I', null, { actor: 'agent' }).ok, true);
+        assert.equal(canTransition('C', 'B', null, { actor: 'agent' }).ok, true); // reject route
+    });
+    test('35. human/legacy path unchanged: A→B still uses ctx auditStatus', () => {
+        // No gate arg ⇒ legacy behavior; auditStatus!=='pass' blocks.
+        assert.equal(canTransition('A', 'B', { auditStatus: 'fail' } as never).ok, false);
+        assert.equal(canTransition('A', 'B', { auditStatus: 'pass' } as never).ok, true);
+        assert.equal(canTransition('A', 'B', { userApproved: true } as never).ok, true);
+        // Human actor explicitly ⇒ still legacy (not the agent form-gate).
+        assert.equal(canTransition('A', 'B', { userApproved: true } as never, { actor: 'human' }).ok, true);
+    });
+
+    // --- Phase 60: prompts instruct the --attest evidence transport ---
+    test('36. P/A/B prompts instruct advancing with --attest', () => {
+        assert.match(getStatePrompt('P'), /orchestrate A --attest/, 'P must instruct --attest to enter A');
+        assert.match(getStatePrompt('A'), /orchestrate B --attest/, 'A must instruct --attest to enter B');
+        assert.match(getStatePrompt('B'), /orchestrate C --attest/, 'B must instruct --attest to enter C');
+    });
+    test('37. C prompt uniquely requires checkOutput in the C→D attestation', () => {
+        const c = getStatePrompt('C');
+        assert.match(c, /orchestrate D --attest/, 'C must instruct --attest to enter D');
+        assert.match(c, /checkOutput/, 'C→D attestation must require pasted checkOutput');
+    });
+
+    // --- #253: scope rebind guard binds interview answers to the parent goal ---
+    test('38. scope rebind guard is empty without interview ctx', () => {
+        const ctx = { originalPrompt: 'build academy', workingDir: null, plan: null, workerResults: [], origin: 'web' };
+        assert.equal(buildScopeRebindGuard(ctx), '');
+    });
+    test('39. scope rebind guard binds interview answers to parent goal', () => {
+        const ctx = {
+            originalPrompt: 'Add a one-time study-session end notifier',
+            workingDir: null,
+            plan: null,
+            workerResults: [],
+            origin: 'web',
+            interview: {
+                request: 'Clarify praise phrase style and storage',
+                round: 2,
+                known: [],
+                unknown: [],
+            },
+        };
+        const guard = buildScopeRebindGuard(ctx);
+        assert.match(guard, /Scope Rebind Guard/);
+        assert.match(guard, /Parent Goal: Add a one-time study-session end notifier/);
+        assert.match(guard, /Interview Purpose: Clarify praise phrase style and storage/);
+        assert.match(guard, /Do not reinterpret a clarification answer as a new parent task/);
+    });
+    test('40. P prefix includes scope rebind guard when interview ctx exists', () => {
+        const ctx = {
+            originalPrompt: 'Add a session-end break notification',
+            workingDir: null,
+            plan: null,
+            workerResults: [],
+            origin: 'web',
+            interview: { request: 'Pick notification phrase style', round: 1, known: [], unknown: [] },
+        };
+        const prefix = getPrefix('P', 'user', ctx)!;
+        assert.match(prefix, /PLANNING MODE/);
+        assert.match(prefix, /Scope Rebind Guard/);
+        assert.match(prefix, /Bind interview answers only as parameters/);
     });
 });

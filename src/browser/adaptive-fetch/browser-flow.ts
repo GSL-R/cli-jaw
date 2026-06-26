@@ -1,4 +1,5 @@
-import type { AdaptiveFetchOptions, AttemptTrace, ChallengeInfo } from './types.js';
+import type { AdaptiveFetchOptions, AttemptTrace, ChallengeInfo, ReaderCandidate } from './types.js';
+import { validateFetchUrl } from './safety.js';
 import {
     collectBrowserCandidate,
     collectBrowserMetadataCandidate,
@@ -7,7 +8,9 @@ import {
     collectNetworkJsonCandidates,
 } from './browser-escalation.js';
 import { BrowserRequiredError } from './browser-runtime.js';
+import { fetchViaCamoufox } from './camoufox-session.js';
 import { scoreReaderCandidate } from './content-scorer.js';
+import { extractStructuredContent } from './structured-extractor.js';
 import { fromBrowserResult, fromMetadataResult, fromNetworkCandidate } from './reader-adapters.js';
 import { appendAttempt } from './trace.js';
 
@@ -17,8 +20,38 @@ export async function tryBrowserEscalation(
     deps: Record<string, unknown>,
     trace: AttemptTrace,
     challengeInfo: ChallengeInfo | null,
+    signal?: AbortSignal,
 ): Promise<Record<string, unknown> | null> {
     if (options.browserMode === 'never') return null;
+    if (signal?.aborted) return null; // P0-6: overall deadline already fired
+
+    const allCandidates: ReaderCandidate[] = [];
+
+    const camoufoxResult = await fetchViaCamoufox(url, { timeoutMs: options.timeoutMs, ...(signal ? { signal } : {}) });
+    if (camoufoxResult?.ok && camoufoxResult.html && isSafeFinalUrl(camoufoxResult.url || url, options)) {
+        const structured = extractStructuredContent(camoufoxResult.html);
+        const evidence = ['camoufox-stealth'];
+        if (structured.tables.length) evidence.push(`structured:${structured.tables.length}-tables`);
+        if (structured.jsonLd.length) evidence.push(`structured:${structured.jsonLd.length}-jsonld`);
+        appendAttempt(trace, { source: 'camoufox', verdict: 'ok', url, reason: 'camoufox-stealth' });
+
+        const camoufoxCandidate = fromBrowserResult({
+            ok: true, status: 200, finalUrl: camoufoxResult.url || url,
+            contentType: 'text/html', text: camoufoxResult.html,
+            title: camoufoxResult.title, headers: {}, evidence, warnings: [],
+            structured, label: 'camoufox-stealth',
+        });
+        const scored = scoreReaderCandidate(camoufoxCandidate);
+        appendScoredAttempt(trace, 'camoufox', camoufoxCandidate, { finalUrl: camoufoxResult.url || url, status: 200, label: 'camoufox-stealth' });
+        allCandidates.push(camoufoxCandidate);
+
+        if (scored.verdict === 'strong_ok') {
+            return buildBrowserFlowResult(url, camoufoxResult, structured, evidence, allCandidates);
+        }
+    } else if (camoufoxResult === null) {
+        appendAttempt(trace, { source: 'camoufox', verdict: 'skip', url, reason: 'camoufox-not-available' });
+    }
+
     try {
         const result = await collectBrowserCandidate(url, {
             browserDeps: deps,
@@ -27,6 +60,7 @@ export async function tryBrowserEscalation(
             selector: options.selector,
             allowPrivateNetwork: options.allowPrivateNetwork,
             challengeInfo,
+            ...(signal ? { signal } : {}),
         });
         appendScoredAttempt(trace, 'browser', fromBrowserResult(result), result);
         const metadataCandidate = collectBrowserMetadataCandidate(result);
@@ -48,9 +82,45 @@ export async function tryBrowserEscalation(
                 url,
                 reason: (error as Error).message,
             });
+            if (allCandidates.length > 0) {
+                return buildCandidateOnlyResult(url, allCandidates);
+            }
             return null;
         }
         throw error;
+    }
+}
+
+function buildBrowserFlowResult(
+    url: string,
+    camoufoxResult: { html: string; title: string; url: string },
+    structured: { tables: unknown[]; jsonLd: unknown[] },
+    evidence: string[],
+    _candidates: ReaderCandidate[],
+): Record<string, unknown> {
+    return {
+        ok: true, status: 200, finalUrl: camoufoxResult.url || url,
+        contentType: 'text/html', text: camoufoxResult.html,
+        title: camoufoxResult.title, headers: {}, evidence, warnings: [], structured,
+    };
+}
+
+function buildCandidateOnlyResult(url: string, candidates: ReaderCandidate[]): Record<string, unknown> {
+    const best = candidates[0];
+    if (!best) return { ok: false, finalUrl: url, text: '', title: '', status: 0, evidence: [], warnings: [] };
+    return {
+        ok: best.ok, status: best.status, finalUrl: best.finalUrl,
+        contentType: best.contentType, text: best.text,
+        title: best.title, headers: {}, evidence: best.evidence, warnings: best.warnings,
+    };
+}
+
+function isSafeFinalUrl(finalUrl: string, options: AdaptiveFetchOptions): boolean {
+    try {
+        validateFetchUrl(finalUrl, { allowPrivateNetwork: options.allowPrivateNetwork });
+        return true;
+    } catch {
+        return false;
     }
 }
 

@@ -96,8 +96,12 @@ test('goal continuation prompt requires executing PABCD transition commands thro
         assert.equal(res.shouldContinue, true);
         assert.match(res.prompt ?? '', /Phase-transition commands are mandatory actions/);
         assert.match(res.prompt ?? '', /Run the exact `cli-jaw orchestrate \.\.\.` command/);
-        assert.match(res.prompt ?? '', /C passed → `cli-jaw orchestrate D` immediately/);
+        assert.match(res.prompt ?? '', /C passed → `cli-jaw orchestrate D --attest/);
         assert.match(res.prompt ?? '', /do NOT only say "run D"/);
+        // Phase 60: goal-mode override must instruct the evidence gate, else self-advance 409s.
+        assert.match(res.prompt ?? '', /EVIDENCE GATE/);
+        assert.match(res.prompt ?? '', /--attest/);
+        assert.match(res.prompt ?? '', /checkOutput/);
     } finally {
         cleanup();
     }
@@ -143,7 +147,25 @@ test('goal continuation prompt requires documentation implementation verificatio
         assert.match(res.prompt ?? '', /Documentation evidence = devlog\/structure\/update path/);
         assert.match(res.prompt ?? '', /implementation evidence = changed source\/test paths or explicit no-code rationale/);
         assert.match(res.prompt ?? '', /verification evidence = fresh command\/test output/);
-        assert.match(res.prompt ?? '', /Do not advance a development phase unless the documentation, implementation, and verification evidence bundle is present/);
+        assert.match(res.prompt ?? '', /Do not advance a PABCD-phase within the current cycle unless its documentation \+ implementation \+ verification evidence is present/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('goal continuation prompt enforces per-work-phase full PABCD loop and anti-skip', () => {
+    cleanup();
+    try {
+        setGoal('contract: work-phase loop');
+        setState('B');
+        const res = buildGoalContinuation();
+        assert.equal(res.shouldContinue, true);
+        const p = res.prompt ?? '';
+        assert.match(p, /ONE WORK-PHASE = ONE FULL PABCD CYCLE/);
+        assert.match(p, /WORK-PHASE BOUNDARY/);
+        assert.match(p, /cli-jaw orchestrate P` to start the next work-phase/);
+        assert.match(p, /FAITHFUL EXECUTION \(anti-skip\)/);
+        assert.match(p, /never rubber-stamp a phase to move on/);
     } finally {
         cleanup();
     }
