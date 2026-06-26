@@ -8,7 +8,7 @@ import { spawn, type ChildProcess } from 'child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { broadcast } from '../core/bus.js';
 import { publish as ssePublish } from '../core/event-bus.js';
-import { settings, UPLOADS_DIR, detectCli, getProjectDirs } from '../core/config.js';
+import { settings, UPLOADS_DIR, detectCli, getProjectDirs, JAW_HOME } from '../core/config.js';
 import { migrateLegacyClaudeValue } from '../cli/claude-models.js';
 import { stripUndefined } from '../core/strip-undefined.js';
 import {
@@ -88,6 +88,75 @@ import { getEmployeeMcpServers } from './mcp-passthrough.js';
 
 export let activeProcess: ChildProcess | null = null;
 export const activeProcesses = new Map<string, ChildProcess>(); // agentId → child process
+
+const LAST_INTERRUPTION_PATH = join(JAW_HOME, 'data', 'last_interruption.json');
+const INTERRUPTION_TTL_MS = 15 * 60_000;
+
+type LastInterruption = {
+    ts: number;
+    cli: string;
+    agentLabel: string;
+    reason: string;
+    promptPreview: string;
+    origin?: string;
+};
+
+function truncateInterruptionText(value: string, max = 800): string {
+    const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+    return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
+}
+
+function persistLastInterruption(input: Omit<LastInterruption, 'ts'>): void {
+    try {
+        fs.mkdirSync(join(JAW_HOME, 'data'), { recursive: true });
+        const payload: LastInterruption = {
+            ts: Date.now(),
+            ...input,
+            promptPreview: truncateInterruptionText(input.promptPreview),
+        };
+        fs.writeFileSync(LAST_INTERRUPTION_PATH, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 });
+    } catch (e) {
+        console.warn('[jaw:recovery] failed to persist interruption:', (e as Error).message);
+    }
+}
+
+function consumeLastInterruption(): LastInterruption | null {
+    try {
+        if (!fs.existsSync(LAST_INTERRUPTION_PATH)) return null;
+        const raw = fs.readFileSync(LAST_INTERRUPTION_PATH, 'utf8');
+        fs.rmSync(LAST_INTERRUPTION_PATH, { force: true });
+        const parsed = JSON.parse(raw) as Partial<LastInterruption>;
+        if (!parsed || typeof parsed.ts !== 'number' || typeof parsed.reason !== 'string') return null;
+        if (Date.now() - parsed.ts > INTERRUPTION_TTL_MS) return null;
+        return {
+            ts: parsed.ts,
+            cli: String(parsed.cli || 'unknown'),
+            agentLabel: String(parsed.agentLabel || 'main'),
+            reason: parsed.reason,
+            promptPreview: String(parsed.promptPreview || ''),
+            ...(parsed.origin ? { origin: String(parsed.origin) } : {}),
+        };
+    } catch (e) {
+        console.warn('[jaw:recovery] failed to consume interruption:', (e as Error).message);
+        return null;
+    }
+}
+
+function buildInterruptionRecoveryPrompt(item: LastInterruption): string {
+    const when = new Date(item.ts).toISOString();
+    return [
+        '[Previous turn interrupted by cli-jaw watchdog]',
+        `Time: ${when}`,
+        `Reason: ${item.reason}`,
+        item.promptPreview ? `Interrupted user/task preview: ${item.promptPreview}` : '',
+        '',
+        'Recovery rules:',
+        '- Do not restart by repeating the same broad search or filesystem scan.',
+        '- First explain briefly that the previous attempt was interrupted by the watchdog and why.',
+        '- Continue from the interrupted task using a narrower route: memory search, known canonical file, or a dedicated tool.',
+        '- If the safe next step is unclear, ask one short clarification instead of broad list_dir/grep_search.',
+    ].filter(Boolean).join('\n');
+}
 
 function registerActiveProcess(agentLabel: string, child: ChildProcess): void {
     const prev = activeProcesses.get(agentLabel);
@@ -1046,6 +1115,14 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         if (pending) {
             console.log(`[jaw:compact] injecting bootstrap (${pending.length} chars)`);
             prompt = `${pending}\n\n---\n\n${prompt}`;
+        }
+    }
+
+    if (!opts.agentId && !opts.internal && origin !== 'heartbeat') {
+        const interrupted = consumeLastInterruption();
+        if (interrupted) {
+            console.log(`[jaw:recovery] injecting interruption recovery (${interrupted.reason})`);
+            prompt = `${buildInterruptionRecoveryPrompt(interrupted)}\n\n---\n\n${prompt}`;
         }
     }
 
@@ -2157,9 +2234,20 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     if (typeof agentTimeoutCfg['idleMs'] === 'number') watchdogConfig.idleMs = agentTimeoutCfg['idleMs'];
     if (typeof agentTimeoutCfg['absoluteMs'] === 'number') watchdogConfig.absoluteMs = agentTimeoutCfg['absoluteMs'];
     if (typeof agentTimeoutCfg['absoluteHardCapMs'] === 'number') watchdogConfig.absoluteHardCapMs = agentTimeoutCfg['absoluteHardCapMs'];
+    const recordMainInterruption = (reason: string) => {
+        if (!mainManaged || opts.internal) return;
+        persistLastInterruption({
+            cli,
+            agentLabel,
+            reason,
+            promptPreview: prompt,
+            origin,
+        });
+    };
     const stallWatchdog = attachWatchdog(child, agentLabel, (reason) => {
         console.log(`[jaw:watchdog] killing ${agentLabel} — ${reason}`);
         ctx.stallReason = reason;
+        recordMainInterruption(reason);
         if (child.pid) {
             killProcessTree(child.pid, 'SIGTERM');
             setTimeout(() => {
@@ -2195,6 +2283,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 const reason = `agy checkpoint stalled for ${Math.round(stalledMs / 1000)}s${conversationId ? ` (conversation ${conversationId})` : ''}`;
                 console.log(`[jaw:watchdog] killing ${agentLabel} — ${reason}`);
                 ctx.stallReason = reason;
+                recordMainInterruption(reason);
                 ctx.stallWatchdog?.stop();
                 if (child.pid) {
                     killProcessTree(child.pid, 'SIGTERM');
@@ -2207,6 +2296,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 const detail = `${reason}${conversationId ? ` (conversation ${conversationId})` : ''}`;
                 console.log(`[jaw:watchdog] killing ${agentLabel} — ${detail}`);
                 ctx.stallReason = detail;
+                recordMainInterruption(detail);
                 ctx.stallWatchdog?.stop();
                 if (child.pid) {
                     killProcessTree(child.pid, 'SIGTERM');
