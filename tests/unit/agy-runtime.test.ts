@@ -150,6 +150,10 @@ test('AGY-RT-017: AGY spill prompt keeps critical Arona bootstrap in argv prompt
     assert.match(spawnSrc, /utf8TruncateMiddle\(currentPrompt/);
     assert.match(spawnSrc, /Telegram boundary/);
     assert.match(spawnSrc, /Search boundary/);
+    assert.match(spawnSrc, /diary_pair\.py/);
+    assert.match(spawnSrc, /Do not use cli-jaw memory save/);
+    assert.match(spawnSrc, /const agyTaskPromptForArgs = promptForArgs/);
+    assert.match(spawnSrc, /prepareAgyPromptWorkspace\(sysPrompt \|\| '', agyTaskPromptForArgs/);
 });
 
 test('AGY-RT-009: AGY print runs can finish after quiet assistant output', () => {

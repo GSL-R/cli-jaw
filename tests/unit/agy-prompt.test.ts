@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { composeAgyPrompt, resolveAgyPromptOrder } from '../../src/agent/agy-prompt.js';
+import { buildAgySpillWorkspaceFiles, composeAgyPrompt, resolveAgyPromptOrder } from '../../src/agent/agy-prompt.js';
 
 
 test('AGY-PROMPT-001: task-first remains the compatibility default', () => {
@@ -25,4 +25,14 @@ test('AGY-PROMPT-003: unknown settings fail closed to task-first', () => {
 
 test('AGY-PROMPT-004: no system prompt leaves the task untouched', () => {
     assert.equal(composeAgyPrompt('CURRENT', '', 'context-first'), 'CURRENT');
+});
+
+test('AGY-PROMPT-005: spill stores the full system prompt exactly once', () => {
+    const files = buildAgySpillWorkspaceFiles('FULL_SYSTEM', '/project', 'CRITICAL');
+    assert.match(files['AGENTS.md'], /FULL_SYSTEM/);
+    assert.doesNotMatch(files['GEMINI.md'], /FULL_SYSTEM/);
+    assert.doesNotMatch(files['CLAUDE.md'], /FULL_SYSTEM/);
+    assert.doesNotMatch(files['CONTEXT.md'], /FULL_SYSTEM/);
+    assert.match(files['GEMINI.md'], /CRITICAL/);
+    assert.match(files['GEMINI.md'], /AGENTS\.md/);
 });

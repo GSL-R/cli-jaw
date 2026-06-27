@@ -68,7 +68,7 @@ import {
     stripAgyResumeReplayPrefixes,
 } from './agy-runtime.js';
 import { startAgyTranscriptWatcher, type AgyTranscriptWatcherHandle } from './agy-transcript-watcher.js';
-import { composeAgyPrompt, resolveAgyPromptOrder } from './agy-prompt.js';
+import { buildAgySpillWorkspaceFiles, composeAgyPrompt, resolveAgyPromptOrder } from './agy-prompt.js';
 import { appendAssistantTextSegment, normalizeAssistantDisplayText, pushTrace } from './events/helpers.js';
 import { listKiroConversationIdsForCwd } from './kiro-auth.js';
 import {
@@ -815,6 +815,8 @@ const AGY_SPILL_RUNTIME_BOOTSTRAP = [
     '[Critical cli-jaw runtime bootstrap]',
     'You are Arona, the user\'s companion agent. The provider/backend identity is only an implementation detail.',
     'Speak to the user warmly as Arona in Korean 해요체 unless the user asks otherwise. Keep task reports concise, but do not fall back to a generic formal assistant voice.',
+    'Diary route: for a meaningful user-related event, use python3 /home/test/.cli-jaw/scripts/diary_pair.py once and require PAIR_APPENDED_OK. Do not use cli-jaw memory save for Live/Arona diaries. Use diary_append.py directly only for Arona-only or machine-only records.',
+    'Ordinary conversation: do not list permissions, inspect knowledge/provider directories, run cli-jaw --help, memory --help, or memory list. Answer directly, then use the exact diary route above only when its trigger applies.',
     'Assume the workspace instructions are already provided by cli-jaw. Do not start a turn by inspecting provider config, agent lists, AGENTS.md, ARONA_SOUL.md, or tool help unless the user asks for that audit or the immediate task cannot proceed without it.',
     'Telegram boundary: never expose file:// links or absolute /home/test paths; mention only basenames when needed.',
     'Search boundary: do not list or search /, /home/test, or the whole .cli-jaw tree. Prefer one memory search or exact known files/narrow directories.',
@@ -866,22 +868,13 @@ function buildAgySpillArgPrompt(currentPrompt: string): string {
     ].join('\n');
 }
 
-function prepareAgyPromptWorkspace(bundleText: string, currentPrompt: string, workingDir: string, label: string): { cwd: string; prompt: string } {
+function prepareAgyPromptWorkspace(systemPrompt: string, currentPrompt: string, workingDir: string, label: string): { cwd: string; prompt: string } {
     const tmpDir = join(os.tmpdir(), `jaw-agy-prompt-${label}-${Date.now()}-${crypto.randomUUID()}`);
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    const promptBundle = [
-        '# cli-jaw AGY prompt bundle',
-        '',
-        bundleText,
-        '',
-        '---',
-        '',
-        `Project root: ${workingDir}`,
-    ].join('\n');
-
-    for (const name of ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', 'CONTEXT.md']) {
-        fs.writeFileSync(join(tmpDir, name), promptBundle);
+    const files = buildAgySpillWorkspaceFiles(systemPrompt, workingDir, AGY_SPILL_RUNTIME_BOOTSTRAP);
+    for (const [name, content] of Object.entries(files)) {
+        fs.writeFileSync(join(tmpDir, name), content);
     }
 
     console.log(`[jaw:${label}] AGY prompt spilled to workspace files → ${tmpDir}`);
@@ -1219,6 +1212,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     let promptForArgs = (cli === 'agy' || cli === 'cursor' || cli === 'kiro-code' || cli === 'gemini' || cli === 'grok' || cli === 'opencode' || (cli === 'ai-e' && effectiveProvider !== 'claude'))
         ? withHistoryPrompt(prompt, historyBlock)
         : prompt;
+    const agyTaskPromptForArgs = promptForArgs;
     if (cli === 'agy' && sysPrompt) {
         promptForArgs = composeAgyPrompt(
             promptForArgs,
@@ -1265,7 +1259,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     };
 
     if (cli === 'agy' && Buffer.byteLength(promptForArgs, 'utf8') > AGY_INLINE_PROMPT_BYTE_LIMIT) {
-        const spilled = prepareAgyPromptWorkspace(promptForArgs, prompt, settings["workingDir"] || os.homedir(), agentLabel);
+        const spilled = prepareAgyPromptWorkspace(sysPrompt || '', agyTaskPromptForArgs, settings["workingDir"] || os.homedir(), agentLabel);
         promptForArgs = spilled.prompt;
         spawnCwd = spilled.cwd;
     }
