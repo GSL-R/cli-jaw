@@ -68,6 +68,7 @@ import {
     stripAgyResumeReplayPrefixes,
 } from './agy-runtime.js';
 import { startAgyTranscriptWatcher, type AgyTranscriptWatcherHandle } from './agy-transcript-watcher.js';
+import { composeAgyPrompt, resolveAgyPromptOrder } from './agy-prompt.js';
 import { appendAssistantTextSegment, normalizeAssistantDisplayText, pushTrace } from './events/helpers.js';
 import { listKiroConversationIdsForCwd } from './kiro-auth.js';
 import {
@@ -1219,7 +1220,11 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ? withHistoryPrompt(prompt, historyBlock)
         : prompt;
     if (cli === 'agy' && sysPrompt) {
-        promptForArgs = `[Current cli-jaw task]\n${promptForArgs}\n\n---\n\n[Operational Context — cli-jaw Integration]\nThe following operational guidelines apply to this session. Follow these task rules and use the tools/commands described:\n\n${sysPrompt}`;
+        promptForArgs = composeAgyPrompt(
+            promptForArgs,
+            sysPrompt,
+            resolveAgyPromptOrder(cfg.promptOrder),
+        );
     } else if ((cli === 'kiro-code' || (cli === 'ai-e' && effectiveProvider === 'kiro')) && sysPrompt) {
         promptForArgs = `[Operational Context — cli-jaw Integration]\nThe following operational guidelines apply to this session. Follow these task rules and use the tools/commands described:\n\n${sysPrompt}\n\n---\n\n${promptForArgs}`;
     }
