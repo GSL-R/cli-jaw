@@ -152,8 +152,11 @@ test('AGY-RT-017: AGY spill prompt keeps critical Arona bootstrap in argv prompt
     assert.match(spawnSrc, /Search boundary/);
     assert.match(spawnSrc, /Read-only closure/);
     assert.match(spawnSrc, /Async closure/);
+    assert.match(spawnSrc, /Paired persistence/);
     assert.match(spawnSrc, /ask whether to add it/);
     assert.match(spawnSrc, /wait or poll in this run/);
+    assert.match(spawnSrc, /cumulative, not alternatives/);
+    assert.match(spawnSrc, /formatting-only edits and machine-only maintenance/);
     assert.match(spawnSrc, /diary_pair\.py/);
     assert.match(spawnSrc, /Do not use cli-jaw memory save/);
     assert.match(spawnSrc, /const agyTaskPromptForArgs = promptForArgs/);

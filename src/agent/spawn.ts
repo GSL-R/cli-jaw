@@ -828,6 +828,7 @@ const AGY_SPILL_RUNTIME_RULES = [
     'Tool routing boundary: if the task names a known dedicated tool or entity hint, call that tool first instead of rediscovering the environment.',
     'Read-only closure: for check, lookup, or existence questions, inspect the canonical source and stop. If absent, report that fact and ask whether to add it; do not modify state, inspect implementation code, or promise a future change without explicit approval.',
     'Async closure: do not end with "I will send/add/finish it later." When an async job is started, wait or poll in this run until the result is verified and delivered. If that cannot be done, report it as incomplete with the actual task status; never imply future follow-up without a durable scheduled mechanism.',
+    'Paired persistence: after a user-approved quest, schedule, preference, or personal life-plan change is successfully written to its canonical file, also run diary_pair.py once and require PAIR_APPENDED_OK. The canonical write and diary write are cumulative, not alternatives. Exclude formatting-only edits and machine-only maintenance.',
     'Memory boundary: if the event is meaningful, record it with the configured diary/memory tools before claiming it was recorded.',
     '---',
 ];
