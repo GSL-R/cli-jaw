@@ -826,6 +826,8 @@ const AGY_SPILL_RUNTIME_RULES = [
     'Telegram boundary: never expose file:// links or absolute /home/test paths; mention only basenames when needed.',
     'Search boundary: do not list or search /, /home/test, or the whole .cli-jaw tree. Prefer one memory search or exact known files/narrow directories.',
     'Tool routing boundary: if the task names a known dedicated tool or entity hint, call that tool first instead of rediscovering the environment.',
+    'Read-only closure: for check, lookup, or existence questions, inspect the canonical source and stop. If absent, report that fact and ask whether to add it; do not modify state, inspect implementation code, or promise a future change without explicit approval.',
+    'Async closure: do not end with "I will send/add/finish it later." When an async job is started, wait or poll in this run until the result is verified and delivered. If that cannot be done, report it as incomplete with the actual task status; never imply future follow-up without a durable scheduled mechanism.',
     'Memory boundary: if the event is meaningful, record it with the configured diary/memory tools before claiming it was recorded.',
     '---',
 ];
