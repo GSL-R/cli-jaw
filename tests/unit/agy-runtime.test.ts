@@ -143,11 +143,11 @@ test('AGY-RT-008: AGY print timeout is a hard cap while cli-jaw watchdog owns pr
 
 test('AGY-RT-017: AGY spill prompt keeps critical Arona bootstrap in argv prompt', () => {
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /AGY_SPILL_RUNTIME_BOOTSTRAP/);
+    assert.match(spawnSrc, /loadAgySpillRuntimeBootstrap/);
+    assert.match(spawnSrc, /canonical-routes\.json/);
+    assert.match(spawnSrc, /serializeAgyCompactRoutes/);
     assert.match(spawnSrc, /You are Arona/);
     assert.match(spawnSrc, /buildAgySpillArgPrompt/);
-    assert.match(spawnSrc, /Current Task Prompt/);
-    assert.match(spawnSrc, /utf8TruncateMiddle\(currentPrompt/);
     assert.match(spawnSrc, /Telegram boundary/);
     assert.match(spawnSrc, /Search boundary/);
     assert.match(spawnSrc, /diary_pair\.py/);

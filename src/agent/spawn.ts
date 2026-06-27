@@ -68,7 +68,13 @@ import {
     stripAgyResumeReplayPrefixes,
 } from './agy-runtime.js';
 import { startAgyTranscriptWatcher, type AgyTranscriptWatcherHandle } from './agy-transcript-watcher.js';
-import { buildAgySpillWorkspaceFiles, composeAgyPrompt, resolveAgyPromptOrder } from './agy-prompt.js';
+import {
+    buildAgySpillArgPrompt,
+    buildAgySpillWorkspaceFiles,
+    composeAgyPrompt,
+    resolveAgyPromptOrder,
+    serializeAgyCompactRoutes,
+} from './agy-prompt.js';
 import { appendAssistantTextSegment, normalizeAssistantDisplayText, pushTrace } from './events/helpers.js';
 import { listKiroConversationIdsForCwd } from './kiro-auth.js';
 import {
@@ -809,9 +815,8 @@ function cleanupEmployeeTmpDir(cwd: string, workingDir: string, label: string) {
 }
 
 const AGY_INLINE_PROMPT_BYTE_LIMIT = 12000;
-const AGY_PROMPT_FALLBACK_TEXT = 'Continue using the workspace instructions and proceed with the current task shown below.';
-const AGY_SPILL_CURRENT_PROMPT_BUDGET = 9000;
-const AGY_SPILL_RUNTIME_BOOTSTRAP = [
+const AGY_COMPACT_ROUTES_PATH = join(JAW_HOME, 'data', 'canonical-routes.json');
+const AGY_SPILL_RUNTIME_RULES = [
     '[Critical cli-jaw runtime bootstrap]',
     'You are Arona, the user\'s companion agent. The provider/backend identity is only an implementation detail.',
     'Speak to the user warmly as Arona in Korean 해요체 unless the user asks otherwise. Keep task reports concise, but do not fall back to a generic formal assistant voice.',
@@ -823,62 +828,37 @@ const AGY_SPILL_RUNTIME_BOOTSTRAP = [
     'Tool routing boundary: if the task names a known dedicated tool or entity hint, call that tool first instead of rediscovering the environment.',
     'Memory boundary: if the event is meaningful, record it with the configured diary/memory tools before claiming it was recorded.',
     '---',
-].join('\n');
+];
 
-function utf8TruncateMiddle(text: string, maxBytes: number): string {
-    if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
-    const marker = '\n\n[... cli-jaw truncated older middle context for AGY argv size ...]\n\n';
-    const markerBytes = Buffer.byteLength(marker, 'utf8');
-    const sideBudget = Math.max(0, maxBytes - markerBytes);
-    const headBudget = Math.floor(sideBudget * 0.35);
-    const tailBudget = sideBudget - headBudget;
-
-    let head = '';
-    let headBytes = 0;
-    for (const ch of text) {
-        const b = Buffer.byteLength(ch, 'utf8');
-        if (headBytes + b > headBudget) break;
-        head += ch;
-        headBytes += b;
+function loadAgySpillRuntimeBootstrap(): string {
+    let compactRoutes = '';
+    try {
+        compactRoutes = serializeAgyCompactRoutes(JSON.parse(fs.readFileSync(AGY_COMPACT_ROUTES_PATH, 'utf8')));
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            console.warn('[jaw:agy] compact route map ignored:', (error as Error).message);
+        }
     }
 
-    let tail = '';
-    let tailBytes = 0;
-    for (const ch of Array.from(text).reverse()) {
-        const b = Buffer.byteLength(ch, 'utf8');
-        if (tailBytes + b > tailBudget) break;
-        tail = ch + tail;
-        tailBytes += b;
-    }
-
-    return `${head}${marker}${tail}`;
-}
-
-function buildAgySpillArgPrompt(currentPrompt: string): string {
-    const promptWithBootstrap = `${AGY_SPILL_RUNTIME_BOOTSTRAP}\n${currentPrompt}`;
-    if (Buffer.byteLength(promptWithBootstrap, 'utf8') <= AGY_INLINE_PROMPT_BYTE_LIMIT) return promptWithBootstrap;
-
-    const truncatedCurrent = utf8TruncateMiddle(currentPrompt, AGY_SPILL_CURRENT_PROMPT_BUDGET);
     return [
-        AGY_SPILL_RUNTIME_BOOTSTRAP,
-        AGY_PROMPT_FALLBACK_TEXT,
-        '',
-        '## Current Task Prompt',
-        truncatedCurrent,
-    ].join('\n');
+        AGY_SPILL_RUNTIME_RULES[0],
+        compactRoutes,
+        ...AGY_SPILL_RUNTIME_RULES.slice(1),
+    ].filter(Boolean).join('\n');
 }
 
 function prepareAgyPromptWorkspace(systemPrompt: string, currentPrompt: string, workingDir: string, label: string): { cwd: string; prompt: string } {
     const tmpDir = join(os.tmpdir(), `jaw-agy-prompt-${label}-${Date.now()}-${crypto.randomUUID()}`);
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    const files = buildAgySpillWorkspaceFiles(systemPrompt, workingDir, AGY_SPILL_RUNTIME_BOOTSTRAP);
+    const runtimeBootstrap = loadAgySpillRuntimeBootstrap();
+    const files = buildAgySpillWorkspaceFiles(systemPrompt, workingDir, runtimeBootstrap);
     for (const [name, content] of Object.entries(files)) {
         fs.writeFileSync(join(tmpDir, name), content);
     }
 
     console.log(`[jaw:${label}] AGY prompt spilled to workspace files → ${tmpDir}`);
-    return { cwd: tmpDir, prompt: buildAgySpillArgPrompt(currentPrompt) };
+    return { cwd: tmpDir, prompt: buildAgySpillArgPrompt(runtimeBootstrap, currentPrompt, AGY_INLINE_PROMPT_BYTE_LIMIT) };
 }
 
 export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {

@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildAgySpillWorkspaceFiles, composeAgyPrompt, resolveAgyPromptOrder } from '../../src/agent/agy-prompt.js';
+import {
+    buildAgySpillArgPrompt,
+    buildAgySpillWorkspaceFiles,
+    composeAgyPrompt,
+    resolveAgyPromptOrder,
+    serializeAgyCompactRoutes,
+} from '../../src/agent/agy-prompt.js';
 
 
 test('AGY-PROMPT-001: task-first remains the compatibility default', () => {
@@ -35,4 +41,31 @@ test('AGY-PROMPT-005: spill stores the full system prompt exactly once', () => {
     assert.doesNotMatch(files['CONTEXT.md'], /FULL_SYSTEM/);
     assert.match(files['GEMINI.md'], /CRITICAL/);
     assert.match(files['GEMINI.md'], /AGENTS\.md/);
+});
+
+test('AGY-PROMPT-006: compact routes stay bounded and reject malformed entries', () => {
+    const routes = serializeAgyCompactRoutes({
+        quest: 'daily quest -> /known/quest.md',
+        'bad key!': 'ignored',
+        empty: '   ',
+        diary_pair: 'meaningful event -> diary_pair.py',
+    }, 180);
+
+    assert.match(routes, /^\[Canonical routes/);
+    assert.match(routes, /quest:/);
+    assert.match(routes, /diary_pair:/);
+    assert.doesNotMatch(routes, /bad key/);
+    assert.ok(Buffer.byteLength(routes, 'utf8') <= 180);
+});
+
+test('AGY-PROMPT-007: spill argv respects byte limit and preserves current task tail', () => {
+    const prompt = buildAgySpillArgPrompt(
+        `BOOT\n${'규칙'.repeat(3000)}`,
+        `OLD\n${'과거'.repeat(5000)}\nCURRENT_TASK_TAIL`,
+        12000,
+    );
+
+    assert.ok(Buffer.byteLength(prompt, 'utf8') <= 12000);
+    assert.match(prompt, /Current Task Prompt/);
+    assert.match(prompt, /CURRENT_TASK_TAIL$/);
 });
