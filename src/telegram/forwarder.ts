@@ -72,7 +72,6 @@ export function sanitizeTelegramVisibleText(text: string) {
     next = next.replace(/(?<![\w`])\/home\/test\/[^\s)\]]+/g, (match) => `\`${basenameForDisplay(match)}\``);
     return next;
 }
-
 function isUserSafeWatchdogDiagnostic(text: string) {
     return /^❌\s*⏱️\s*응답 없음\s*—\s+/.test(String(text || '').trim());
 }

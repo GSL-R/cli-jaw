@@ -123,26 +123,37 @@ test('SF-004: buildHistoryBlock filters stale worklog continue artifacts', () =>
 test('SF-004b: resume argv CLIs keep enriched promptForArgs for agy and compact handoff', () => {
     const src = fs.readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     const promptForArgsIdx = src.indexOf('let promptForArgs =');
-    const resumeArgsIdx = src.indexOf('args = buildResumeArgs(cli');
+    const buildCurrentArgsIdx = src.indexOf('const buildCurrentArgs =');
+    const agyBootstrapIdx = src.indexOf('agyBootstrap = buildAgyBootstrapEnvelope');
+    const agyPromptAssignIdx = src.indexOf('promptForArgs = agyBootstrap.prompt');
 
     assert.ok(promptForArgsIdx > 0, 'spawn should compute promptForArgs before argv construction');
-    assert.ok(resumeArgsIdx > promptForArgsIdx, 'resume args should be built after promptForArgs');
+    assert.ok(buildCurrentArgsIdx > promptForArgsIdx, 'argv builder should be defined after promptForArgs');
+    assert.ok(agyBootstrapIdx > buildCurrentArgsIdx, 'AGY bootstrap should be built after argv builder setup');
+    assert.ok(agyPromptAssignIdx > agyBootstrapIdx, 'AGY promptForArgs should be replaced with bootstrap prompt before args are built');
     assert.ok(
-        src.includes('buildResumeArgs(cli, runtimeModel, effort, sid, promptForArgs, permissions, argOptions)'),
+        src.includes('buildResumeArgs(cli, runtimeModel, effort, sid, promptForArgs, permissions, options)'),
         'resume argv CLIs must receive promptForArgs, not raw prompt',
+    );
+    assert.ok(
+        src.includes("if (cli !== 'agy') args = buildCurrentArgs(argOptions);"),
+        'AGY must defer argv construction until after bootstrap prompt replacement',
     );
 });
 
-test('SF-004c: agy delegates configurable prompt ordering to the bounded composer', () => {
+test('SF-004c: agy delegates configurable prompt ordering to the bootstrap envelope', () => {
     const src = fs.readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    const agyBranchIdx = src.indexOf("if (cli === 'agy' && sysPrompt)");
-    const kiroBranchIdx = src.indexOf("else if ((cli === 'kiro-code'");
-    assert.ok(agyBranchIdx > 0, 'agy should have a dedicated prompt ordering branch');
-    assert.ok(kiroBranchIdx > agyBranchIdx, 'kiro branch should remain separate from agy');
+    const agyBranchIdx = src.indexOf("if (cli === 'agy') {");
+    const preflightIdx = src.indexOf('// ─── DIFF-A: Preflight', agyBranchIdx);
+    assert.ok(agyBranchIdx > 0, 'agy should have a dedicated bootstrap branch');
+    assert.ok(preflightIdx > agyBranchIdx, 'agy branch should be bounded before preflight');
 
-    const agyBranch = src.slice(agyBranchIdx, kiroBranchIdx);
-    assert.ok(agyBranch.includes('composeAgyPrompt('), 'agy should use the dedicated prompt composer');
-    assert.ok(agyBranch.includes('resolveAgyPromptOrder(cfg.promptOrder)'), 'agy should resolve the per-cli prompt order');
+    const agyBranch = src.slice(agyBranchIdx, preflightIdx);
+    assert.ok(agyBranch.includes('buildAgyBootstrapEnvelope({'), 'agy branch should use the bootstrap envelope builder');
+    assert.ok(agyBranch.includes('taskPrompt: prompt'), 'agy bootstrap should receive the current task prompt');
+    assert.ok(agyBranch.includes('operationalContext: sysPrompt'), 'agy bootstrap should receive operational context separately');
+    assert.ok(agyBranch.includes('order: resolveAgyPromptOrder(cfg.promptOrder)'), 'agy bootstrap should use configured prompt ordering');
+    assert.ok(agyBranch.includes('promptForArgs = agyBootstrap.prompt'), 'agy args prompt should be the ordered bootstrap prompt');
 });
 
 // ─── SF-EDGE: processQueue is called after mainManaged exit ───

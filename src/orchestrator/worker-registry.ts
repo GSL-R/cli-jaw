@@ -17,6 +17,7 @@ import {
     recordWorkerRunAttention,
     recordWorkerRunProgress,
 } from './worker-run-store.js';
+import type { RemoteTarget } from '../messaging/types.js';
 
 const workers = new Map<string, WorkerSlot>();
 const previousRuns = new Map<string, WorkerProgressRun>();
@@ -28,9 +29,10 @@ const previousRunIdsByAgentId = new Map<string, string[]>();
 // rather than defaulting to a generic 'system' origin.
 export interface WorkerReplayMeta {
     origin?: string;
-    target?: string;
+    target?: RemoteTarget;
     chatId?: string | number;
     requestId?: string;
+    replyViaTarget?: boolean;
     scopeId?: string;
 }
 

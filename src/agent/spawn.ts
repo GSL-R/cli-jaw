@@ -52,6 +52,7 @@ import {
 } from './opencode-diagnostics.js';
 import type { SpawnContext, ToolEntry } from '../types/agent.js';
 import { asCliEventRecord, discriminate, fieldString, type CliEventRecord } from '../types/cli-events.js';
+import type { RemoteTarget } from '../messaging/types.js';
 import { isJawRuntimeEvent, handleJawRuntimeEvent } from './claude-e-runtime.js';
 import { jawRuntime } from './jwc-runtime.js';
 import { appendTraceEvent, stampTraceTool, startTraceRun } from '../trace/store.js';
@@ -67,11 +68,12 @@ import {
     stripAgyResumeReplayPrefix,
     stripAgyResumeReplayPrefixes,
 } from './agy-runtime.js';
+import { detectAgyCapabilities } from './agy-capabilities.js';
+import { buildAgyBootstrapEnvelope, type AgyBootstrapEnvelope } from './agy-bootstrap.js';
 import { startAgyTranscriptWatcher, type AgyTranscriptWatcherHandle } from './agy-transcript-watcher.js';
 import {
     buildAgySpillArgPrompt,
     buildAgySpillWorkspaceFiles,
-    composeAgyPrompt,
     resolveAgyPromptOrder,
     serializeAgyCompactRoutes,
 } from './agy-prompt.js';
@@ -190,9 +192,10 @@ function registerActiveProcess(agentLabel: string, child: ChildProcess): void {
 // replayed to the correct scope instead of defaulting to 'system'.
 export interface MainSessionMeta {
     origin: string;
-    target?: string;
+    target?: RemoteTarget;
     chatId?: string | number;
     requestId?: string;
+    replyViaTarget?: boolean;
     scopeId?: string;
     cli?: string;
     model?: string;
@@ -743,6 +746,8 @@ function getRecentAssistantContentsForAgyResume(workingDir?: string | null): str
 import { buildArgs, buildResumeArgs, formatAgyPrintTimeout, resolveAiEProvider, resolveSessionBucket } from './args.js';
 export { buildArgs, buildResumeArgs, resolveAiEProvider, resolveSessionBucket };
 
+const warnedAgyCapabilityFallbacks = new Set<string>();
+
 // ─── Upload wrapper ──────────────────────────────────
 
 export const saveUpload = (buffer: Buffer | Uint8Array, originalName: string, options?: SaveUploadOptions) =>
@@ -785,8 +790,9 @@ interface SpawnOpts {
     agentId?: string;
     sysPrompt?: string;
     origin?: string;
-    target?: string;
+    target?: RemoteTarget;
     requestId?: string;
+    replyViaTarget?: boolean;
     employeeSessionId?: string;
     employeeOutputLen?: number;
     chatId?: string | number;
@@ -929,6 +935,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             target: opts.target,
             chatId: opts.chatId,
             requestId: opts.requestId,
+            replyViaTarget: opts.replyViaTarget,
             scopeId: liveScope,
         }));
     }
@@ -1041,6 +1048,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             target: opts.target,
             chatId: opts.chatId,
             requestId: opts.requestId,
+            replyViaTarget: opts.replyViaTarget,
             scopeId: liveScope,
             cli,
             model: runtimeModel,
@@ -1192,17 +1200,11 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             cli === 'gemini' ? GEMINI_HISTORY_MAX_CHARS : 8000,
         )
         : '';
-    let promptForArgs = (cli === 'agy' || cli === 'cursor' || cli === 'kiro-code' || cli === 'gemini' || cli === 'grok' || cli === 'opencode' || (cli === 'ai-e' && effectiveProvider !== 'claude'))
+    let agyBootstrap: AgyBootstrapEnvelope | null = null;
+    let promptForArgs = (cli === 'cursor' || cli === 'kiro-code' || cli === 'gemini' || cli === 'grok' || cli === 'opencode' || (cli === 'ai-e' && effectiveProvider !== 'claude'))
         ? withHistoryPrompt(prompt, historyBlock)
         : prompt;
-    const agyTaskPromptForArgs = promptForArgs;
-    if (cli === 'agy' && sysPrompt) {
-        promptForArgs = composeAgyPrompt(
-            promptForArgs,
-            sysPrompt,
-            resolveAgyPromptOrder(cfg.promptOrder),
-        );
-    } else if ((cli === 'kiro-code' || (cli === 'ai-e' && effectiveProvider === 'kiro')) && sysPrompt) {
+    if ((cli === 'kiro-code' || (cli === 'ai-e' && effectiveProvider === 'kiro')) && sysPrompt) {
         promptForArgs = `[Operational Context — cli-jaw Integration]\nThe following operational guidelines apply to this session. Follow these task rules and use the tools/commands described:\n\n${sysPrompt}\n\n---\n\n${promptForArgs}`;
     }
     const agyResumeReplayPrefix = cli === 'agy' && isResume
@@ -1230,7 +1232,17 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ? formatAgyPrintTimeout(resolvedAgyPrintTimeoutMs)
         : undefined;
     let spawnCwd = settings["workingDir"];
-    const argOptions = {
+    const agyBinaryForCapabilities = cli === 'agy'
+        ? (detectCli('agy').path || 'agy')
+        : null;
+    const agyCapabilities = agyBinaryForCapabilities
+        ? detectAgyCapabilities(agyBinaryForCapabilities)
+        : undefined;
+    if (agyCapabilities?.usedFallback && agyBinaryForCapabilities && !warnedAgyCapabilityFallbacks.has(agyBinaryForCapabilities)) {
+        warnedAgyCapabilityFallbacks.add(agyBinaryForCapabilities);
+        console.warn('[agy-capabilities] probe failed; using legacy emit-all argv compatibility');
+    }
+    let argOptions = {
         fastMode: cfg.fastMode,
         sysPrompt,
         includeDirectories,
@@ -1239,21 +1251,18 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ...(claudeBin ? { claudeBin } : {}),
         ...(agyLogFile ? { agyLogFile } : {}),
         ...(agyPrintTimeout ? { agyPrintTimeout } : {}),
+        ...(agyCapabilities ? { agyCapabilities } : {}),
     };
-
-    if (cli === 'agy' && Buffer.byteLength(promptForArgs, 'utf8') > AGY_INLINE_PROMPT_BYTE_LIMIT) {
-        const spilled = prepareAgyPromptWorkspace(sysPrompt || '', agyTaskPromptForArgs, settings["workingDir"] || os.homedir(), agentLabel);
-        promptForArgs = spilled.prompt;
-        spawnCwd = spilled.cwd;
-    }
-    let args;
-    if (isResume) {
+    const buildCurrentArgs = (options: typeof argOptions): string[] => {
+        if (!isResume) {
+            return buildArgs(cli, runtimeModel, effort, promptForArgs, sysPrompt, permissions, options);
+        }
         const sid = resumeSessionId || '';
         console.log(`[jaw:resume] ${cli} session=${sid.slice(0, 12)}...`);
-        args = buildResumeArgs(cli, runtimeModel, effort, sid, promptForArgs, permissions, argOptions);
-    } else {
-        args = buildArgs(cli, runtimeModel, effort, promptForArgs, sysPrompt, permissions, argOptions);
-    }
+        return buildResumeArgs(cli, runtimeModel, effort, sid, promptForArgs, permissions, options);
+    };
+    let args: string[] = [];
+    if (cli !== 'agy') args = buildCurrentArgs(argOptions);
 
     const traceAudience: 'public' | 'internal' = (opts.internal || isEmployee) ? 'internal' : 'public';
     const parentLiveScopeForChild = !opts.internal && isEmployee ? liveScope : null;
@@ -1283,6 +1292,30 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
 
         spawnCwd = tmpDir;
         console.log(`[jaw:${agentLabel}] Employee isolated → ${tmpDir}`);
+    }
+
+    if (cli === 'agy') {
+        agyBootstrap = buildAgyBootstrapEnvelope({
+            taskPrompt: prompt,
+            historyBlock,
+            workingDir: spawnCwd,
+            sessionId: resumeSessionId,
+            order: resolveAgyPromptOrder(cfg.promptOrder),
+            ...(sysPrompt ? { operationalContext: sysPrompt } : {}),
+        });
+        promptForArgs = agyBootstrap.prompt;
+        if (Buffer.byteLength(promptForArgs, 'utf8') > AGY_INLINE_PROMPT_BYTE_LIMIT) {
+            const spilled = prepareAgyPromptWorkspace(
+                sysPrompt || '',
+                promptForArgs,
+                spawnCwd || os.homedir(),
+                agentLabel,
+            );
+            promptForArgs = spilled.prompt;
+            spawnCwd = spilled.cwd;
+        }
+        argOptions = { ...argOptions, workingDir: spawnCwd };
+        args = buildCurrentArgs(argOptions);
     }
 
     // ─── DIFF-A: Preflight — verify CLI binary exists before spawn ───
@@ -2188,6 +2221,14 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         geminiResultSeen: false,
         ...(opencodeSpawnAudit ? { opencodeSpawnAudit: opencodeSpawnAudit as Record<string, unknown> } : {}),
         ...(agyResumeOffset > 0 ? { agyResumeOffset, agyBytesReceived: 0 } : {}),
+        ...(cli === 'agy' ? {
+            ...(agyBootstrap ? {
+                agyBootstrapSentinel: agyBootstrap.sentinel,
+                agyBootstrapHash: agyBootstrap.hash,
+            } : {}),
+            agyBootstrapAccepted: false,
+            agyBootstrapAcceptanceMode: agyBootstrap ? 'pending' as const : 'not-applicable' as const,
+        } : {}),
         ...(kiroPlainText || cli === 'agy' || cli === 'pi' ? { liveOutputText: '' } : {}),
         ...(kiroPlainText ? { kiroLastVisibleAt: Date.now(), kiroHeartbeatSent: false } : {}),
     };
