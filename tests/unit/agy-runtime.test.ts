@@ -184,6 +184,14 @@ test('AGY-RT-010: AGY quiet completion is mapped to lifecycle success, not inter
     assert.match(spawnSrc, /getAgyQuietCompletionDelayMs\(ctx\)/);
 });
 
+test('AGY-RT-010b: watchdog kills preserve diagnostics and repeated nudges keep the original task', () => {
+    const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
+    assert.match(spawnSrc, /killReasons\.set\(child\.pid, detail\)/);
+    assert.match(spawnSrc, /killReasons\.set\(child\.pid, reason\)/);
+    assert.match(spawnSrc, /isMinimalRecoveryNudge\(incomingTaskPrompt\)/);
+    assert.match(spawnSrc, /promptPreview:\s*interruptionTaskPreview/);
+});
+
 test('AGY-RT-011: AGY timeout suffix is stripped without masking timeout-only output', () => {
     assert.deepEqual(
         stripAgyTrailingTimeoutOutput('JAW_AGY_DONE\nError: timed out waiting for response\n'),

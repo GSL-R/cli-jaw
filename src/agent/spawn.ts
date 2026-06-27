@@ -106,6 +106,13 @@ function truncateInterruptionText(value: string, max = 800): string {
     return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
 }
 
+function isMinimalRecoveryNudge(value: string): boolean {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return true;
+    return /^[.。…·]+$/.test(normalized)
+        || /^(계속|계속해|이어줘|이어가|다시|재개|continue|resume)$/.test(normalized);
+}
+
 function persistLastInterruption(input: Omit<LastInterruption, 'ts'>): void {
     try {
         fs.mkdirSync(join(JAW_HOME, 'data'), { recursive: true });
@@ -881,6 +888,8 @@ function prepareAgyPromptWorkspace(bundleText: string, currentPrompt: string, wo
 }
 
 export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
+    const incomingTaskPrompt = prompt;
+    let interruptionTaskPreview = incomingTaskPrompt;
     const { forceNew = false, agentId, sysPrompt: customSysPrompt, memorySnapshot } = opts;
     const origin = opts.origin || 'web';
     const empSid = opts._skipResume ? null : (opts.employeeSessionId || null);
@@ -1122,6 +1131,9 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         const interrupted = consumeLastInterruption();
         if (interrupted) {
             console.log(`[jaw:recovery] injecting interruption recovery (${interrupted.reason})`);
+            if (isMinimalRecoveryNudge(incomingTaskPrompt) && interrupted.promptPreview) {
+                interruptionTaskPreview = interrupted.promptPreview;
+            }
             prompt = `${buildInterruptionRecoveryPrompt(interrupted)}\n\n---\n\n${prompt}`;
         }
     }
@@ -1729,6 +1741,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             console.log(`[jaw:watchdog] killing ${agentLabel} (pi) — ${reason}`);
             ctx.stallReason = reason;
             if (child.pid) {
+                killReasons.set(child.pid, reason);
                 killProcessTree(child.pid, 'SIGTERM');
                 const pid = child.pid;
                 setTimeout(() => {
@@ -2240,7 +2253,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             cli,
             agentLabel,
             reason,
-            promptPreview: prompt,
+            promptPreview: interruptionTaskPreview,
             origin,
         });
     };
@@ -2249,6 +2262,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ctx.stallReason = reason;
         recordMainInterruption(reason);
         if (child.pid) {
+            killReasons.set(child.pid, reason);
             killProcessTree(child.pid, 'SIGTERM');
             setTimeout(() => {
                 try { killProcessTree(child.pid!, 'SIGKILL'); } catch { /* already dead */ }
@@ -2286,6 +2300,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 recordMainInterruption(reason);
                 ctx.stallWatchdog?.stop();
                 if (child.pid) {
+                    killReasons.set(child.pid, reason);
                     killProcessTree(child.pid, 'SIGTERM');
                     setTimeout(() => {
                         try { killProcessTree(child.pid!, 'SIGKILL'); } catch { /* already dead */ }
@@ -2299,6 +2314,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 recordMainInterruption(detail);
                 ctx.stallWatchdog?.stop();
                 if (child.pid) {
+                    killReasons.set(child.pid, detail);
                     killProcessTree(child.pid, 'SIGTERM');
                     setTimeout(() => {
                         try { killProcessTree(child.pid!, 'SIGKILL'); } catch { /* already dead */ }
