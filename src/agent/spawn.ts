@@ -58,10 +58,12 @@ import { jawRuntime } from './jwc-runtime.js';
 import { appendTraceEvent, stampTraceTool, startTraceRun } from '../trace/store.js';
 import {
     AGY_COMPLETE_KILL_REASON,
+    AGY_TOOL_TRACE_FAILURE_MESSAGE,
     extractAgyConversationId,
     resolveAgyEmptyCloseError,
     formatAgyTimeoutMessage,
     getAgyQuietCompletionDelayMs,
+    isAgyInternalToolTraceOutput,
     isAgyStaleSessionOutput,
     normalizeAgyCloseText,
     stripAgyPromptEchoPrefix,
@@ -2640,6 +2642,17 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             if (ctx.agyFinalPlannerSeen && ctx.agyFinalPlannerText) {
                 ctx.fullText = ctx.agyFinalPlannerText;
                 if (ctx.liveOutputText !== undefined) ctx.liveOutputText = ctx.agyFinalPlannerText;
+            }
+            if (isAgyInternalToolTraceOutput(ctx.fullText)) {
+                console.warn('[jaw:agy] filtered internal tool-planning output without a final answer');
+                ctx.fullText = AGY_TOOL_TRACE_FAILURE_MESSAGE;
+                if (ctx.liveOutputText !== undefined) ctx.liveOutputText = AGY_TOOL_TRACE_FAILURE_MESSAGE;
+                appendTraceEvent({
+                    runId: ctx.traceRunId,
+                    source: 'cli_raw',
+                    eventType: 'invalid_final_output',
+                    raw: AGY_TOOL_TRACE_FAILURE_MESSAGE,
+                });
             }
             const normalizedCloseText = normalizeAgyCloseText({
                 fullText: ctx.fullText,

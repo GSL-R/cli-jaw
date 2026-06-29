@@ -7,11 +7,13 @@ import {
     AGY_COMPLETE_KILL_REASON,
     AGY_FALLBACK_QUIET_COMPLETION_MS,
     AGY_PRINT_QUIET_COMPLETION_MS,
+    AGY_TOOL_TRACE_FAILURE_MESSAGE,
     extractAgyConversationId,
     formatAgyTimeoutMessage,
     formatAgyTranscriptErrorMessage,
     getAgyQuietCompletionDelayMs,
     hasRunningAgyTranscriptTool,
+    isAgyInternalToolTraceOutput,
     isAgyTimeoutOutput,
     normalizeAgyCloseText,
     resolveAgyEmptyCloseError,
@@ -60,6 +62,24 @@ test('AGY-RT-002b: formats unresolved AGY transcript provider errors', () => {
         }),
         null,
     );
+});
+
+test('AGY-RT-002c: detects leaked internal tool-planning output', () => {
+    const leaked = [
+        "🔮 toolAction: '성찰 버퍼 읽기'",
+        "toolSummary: '성찰 버퍼 확인'",
+        "AbsolutePath: '/home/test/.cli-jaw/memory/structured/inner_life/reflections.md'",
+        "toolAction: 'Viewing reflections'",
+        '<truncated 92507 bytes>',
+    ].join('\n');
+    assert.equal(isAgyInternalToolTraceOutput(leaked), true);
+    assert.equal(isAgyInternalToolTraceOutput("toolAction이라는 문자열을 분석한 정상 답변이에요."), false);
+    assert.equal(isAgyInternalToolTraceOutput('정상적인 최종 답변입니다.'), false);
+    assert.match(AGY_TOOL_TRACE_FAILURE_MESSAGE, /without a user-facing final answer/);
+
+    const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
+    assert.match(spawnSrc, /isAgyInternalToolTraceOutput\(ctx\.fullText\)/);
+    assert.match(spawnSrc, /eventType:\s*'invalid_final_output'/);
 });
 
 test('AGY-RT-003: extracts exact native AGY conversation ids from resume hints', () => {

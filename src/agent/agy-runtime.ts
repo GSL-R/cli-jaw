@@ -4,6 +4,7 @@ export const AGY_TIMEOUT_PREFIX = 'Error: timed out waiting for response';
 export const AGY_COMPLETE_KILL_REASON = 'agy-complete';
 export const AGY_PRINT_QUIET_COMPLETION_MS = 5_000;
 export const AGY_FALLBACK_QUIET_COMPLETION_MS = 20_000;
+export const AGY_TOOL_TRACE_FAILURE_MESSAGE = 'AGY did not complete the task: internal tool-planning output was returned without a user-facing final answer.';
 const AGY_CONVERSATION_ID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const AGY_CONVERSATION_ID_RE = new RegExp(
     `(?:\\bagy\\s+)?--conversation(?:=|\\s+)(${AGY_CONVERSATION_ID})\\b|\\b(?:conversation=|Created conversation\\s+)(${AGY_CONVERSATION_ID})\\b`,
@@ -12,6 +13,18 @@ const AGY_CONVERSATION_ID_RE = new RegExp(
 
 export function isAgyTimeoutOutput(text: string): boolean {
     return text.trimStart().startsWith(AGY_TIMEOUT_PREFIX);
+}
+
+export function isAgyInternalToolTraceOutput(text: string): boolean {
+    const value = String(text || '').trimStart();
+    if (!value) return false;
+    const startsAsTrace = /^(?:🔮\s*)?(?:toolAction|toolSummary)\s*:/i.test(value)
+        || /^Lands\s+toolAction\s*=/i.test(value);
+    if (!startsAsTrace) return false;
+    const toolActions = value.match(/(?:^|\n)\s*(?:🔮\s*)?toolAction\s*:/gi)?.length ?? 0;
+    const metadataLines = value.match(/(?:^|\n)\s*(?:toolSummary|AbsolutePath|StartLine|EndLine|IsSkillFile)\s*:/gi)?.length ?? 0;
+    const hasTruncationMarker = /<truncated\s+\d+\s+bytes>/i.test(value);
+    return toolActions >= 2 || metadataLines >= 2 || hasTruncationMarker;
 }
 
 export function formatAgyTimeoutMessage(text: string): string {
