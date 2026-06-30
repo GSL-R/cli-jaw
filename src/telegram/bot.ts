@@ -28,6 +28,13 @@ import { registerSendTransport, sendChannelOutput } from '../messaging/send.js';
 import type { RemoteTarget } from '../messaging/types.js';
 import type { ChannelSendRequest } from '../messaging/send.js';
 import {
+    installTelegramDeliveryGuard,
+    isTelegramParseError,
+    isTelegramRateLimitError,
+    telegramErrorCode,
+    telegramRetryAfter,
+} from './delivery-guard.js';
+import {
     escapeHtmlTg,
     markdownToTelegramHtml,
     chunkTelegramMessage,
@@ -179,6 +186,7 @@ export function getTelegramSendClient(): TelegramSendClientResult {
         return { client: telegramSendOnlyBot };
     }
     telegramSendOnlyBot = new Bot(token);
+    installTelegramDeliveryGuard(telegramSendOnlyBot, token);
     telegramSendOnlyToken = token;
     return { client: telegramSendOnlyBot };
 }
@@ -247,8 +255,25 @@ async function telegramSendHandler(req: ChannelSendRequest): Promise<{ ok: boole
         for (const chunk of chunks) {
             try {
                 await bot.api.sendMessage(chatId, chunk, stripUndefined({ parse_mode: 'HTML', message_thread_id: messageThreadId }));
-            } catch {
-                await bot.api.sendMessage(chatId, chunk.replace(/<[^>]+>/g, ''), stripUndefined({ message_thread_id: messageThreadId }));
+            } catch (err: unknown) {
+                if (!isTelegramParseError(err)) {
+                    return stripUndefined({
+                        ok: false,
+                        error: (err as Error).message || 'Telegram send failed',
+                        statusCode: telegramErrorCode(err) || 502,
+                        retryAfter: telegramRetryAfter(err) || undefined,
+                    });
+                }
+                try {
+                    await bot.api.sendMessage(chatId, chunk.replace(/<[^>]+>/g, ''), stripUndefined({ message_thread_id: messageThreadId }));
+                } catch (fallbackErr: unknown) {
+                    return stripUndefined({
+                        ok: false,
+                        error: (fallbackErr as Error).message || 'Telegram fallback send failed',
+                        statusCode: telegramErrorCode(fallbackErr) || 502,
+                        retryAfter: telegramRetryAfter(fallbackErr) || undefined,
+                    });
+                }
             }
         }
         return { ok: true, chat_id: chatId, type: 'text' };
@@ -395,6 +420,7 @@ async function _initTelegramInner() {
     const bot = new Bot(settings["telegram"].token, {
         client: { fetch: ipv4Fetch as never },
     });
+    installTelegramDeliveryGuard(bot, settings["telegram"].token);
     bot.catch((err) => console.error('[tg:error]', err.message || err));
     bot.use(sequentialize((ctx) => `tg:${ctx.chat?.id || 'unknown'}`));
 
@@ -570,7 +596,8 @@ async function _initTelegramInner() {
             for (const chunk of chunks) {
                 try {
                     await ctx.reply(chunk, { parse_mode: 'HTML' });
-                } catch {
+                } catch (err: unknown) {
+                    if (!isTelegramParseError(err)) throw err;
                     await ctx.reply(chunk.replace(/<[^>]+>/g, ''));
                 }
             }
@@ -586,6 +613,10 @@ async function _initTelegramInner() {
                 ctx.api.deleteMessage(chat.id, statusMsgId).catch(() => { });
             }
             console.error('[tg:error]', err);
+            if (isTelegramRateLimitError(err)) {
+                console.error(`[tg:cooldown] suppressing recursive error reply (${telegramRetryAfter(err)}s remaining)`);
+                return;
+            }
             await ctx.reply(`❌ Error: ${(err as Error).message}`);
         }
     }

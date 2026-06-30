@@ -6,6 +6,7 @@ import { stripUndefined } from '../core/strip-undefined.js';
 import { assertSendFilePath } from '../security/path-guards.js';
 import type { MessengerChannel, OutboundType, RemoteTarget } from './types.js';
 import { getLastActiveTarget, getLatestSeenTarget, clearTargetState } from './runtime.js';
+import { persistTelegramOutbox } from '../telegram/delivery-outbox.js';
 
 // ─── Request Model ──────────────────────────────────
 
@@ -212,5 +213,16 @@ export async function sendChannelOutput(req: ChannelSendRequest): Promise<{ ok: 
         return { ok: false, error: `No send transport registered for ${channel}` };
     }
 
-    return sendFn(req);
+    const result = await sendFn(req);
+    const status = Number(result['statusCode'] ?? result['status'] ?? 0);
+    if (channel === 'telegram' && !result.ok && status === 429) {
+        try {
+            const retryAfter = Number(result['retryAfter'] ?? result['retry_after'] ?? 0) || undefined;
+            const outboxId = persistTelegramOutbox(req, result.error || 'Telegram rate limited', retryAfter);
+            return { ...result, deferred: true, outboxId };
+        } catch (err: unknown) {
+            console.error('[telegram:outbox]', (err as Error).message);
+        }
+    }
+    return result;
 }

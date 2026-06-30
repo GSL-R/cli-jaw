@@ -25,7 +25,6 @@ export const TELEGRAM_LIMITS: Record<string, number> = {
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
-const MAX_DELAY_MS = 30_000;       // single retry delay cap
 const MAX_TOTAL_WAIT_MS = 60_000;  // cumulative wait cap
 
 /**
@@ -58,10 +57,6 @@ function isTransient(err: unknown): boolean {
     const code = e.code || '';
     if (/ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE/.test(code)) return true;
     return false;
-}
-
-function getRetryAfterMs(err: unknown): number {
-    return (asTgErr(err).parameters?.retry_after ?? 0) * 1000;
 }
 
 /** Determine upstream error category for HTTP response code. */
@@ -106,6 +101,17 @@ export async function sendTelegramFile(
         } catch (err: unknown) {
             const e = asTgErr(err);
             const transient = isTransient(err);
+            // 429 is handled by the shared delivery guard. Retrying here would
+            // bypass the persisted cooldown policy and amplify the flood.
+            if (e.error_code === 429 || e.code === 'TELEGRAM_COOLDOWN') {
+                return stripUndefined({
+                    ok: false,
+                    attempts: attempt,
+                    error: e.message || 'Telegram rate limited',
+                    retryAfter: e.parameters?.retry_after,
+                    statusCode: 429,
+                });
+            }
             if (!transient || attempt === MAX_RETRIES) {
                 const sc = transient ? classifyUpstreamError(err) : (e.error_code || e.statusCode || 500);
                 console.error(`[telegram:file] failed after ${attempt} attempt(s):`, e.message);
@@ -117,19 +123,7 @@ export async function sendTelegramFile(
                 });
             }
 
-            const retryAfterMs = getRetryAfterMs(err);
-            // If upstream demands more than MAX_DELAY_MS, bail immediately
-            if (retryAfterMs > MAX_DELAY_MS) {
-                console.error(`[telegram:file] retry_after ${retryAfterMs}ms exceeds cap, giving up`);
-                return stripUndefined({
-                    ok: false, attempts: attempt,
-                    error: `retry_after too large: ${retryAfterMs}ms`,
-                    retryAfter: e.parameters?.retry_after,
-                    statusCode: 429,
-                });
-            }
-
-            const delay = Math.max(retryAfterMs, BASE_DELAY_MS * Math.pow(2, attempt - 1));
+            const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
             totalWaited += delay;
             if (totalWaited >= MAX_TOTAL_WAIT_MS) {
                 console.error(`[telegram:file] total wait ${totalWaited}ms exceeds cap, giving up`);

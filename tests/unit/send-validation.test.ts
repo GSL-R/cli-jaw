@@ -100,6 +100,32 @@ test('sendChannelOutput rejects disallowed explicit target with 403 status', asy
     }
 });
 
+test('sendChannelOutput marks Telegram 429 as deferred with a durable outbox id', async () => {
+    const { settings } = await import('../../src/core/config.js');
+    const { registerSendTransport, sendChannelOutput } = await import('../../src/messaging/send.js');
+    const previousTelegram = settings.telegram;
+    try {
+        settings.telegram = { ...(settings.telegram || {}), enabled: true, allowedChatIds: [123456] };
+        registerSendTransport('telegram', async () => ({
+            ok: false,
+            statusCode: 429,
+            retryAfter: 30,
+            error: 'limited',
+        }));
+        const result = await sendChannelOutput({
+            channel: 'telegram',
+            type: 'text',
+            text: 'preserve me',
+            chatId: '123456',
+        });
+        assert.equal(result.ok, false);
+        assert.equal(result.deferred, true);
+        assert.match(String(result.outboxId), /^[a-f0-9]{20}$/);
+    } finally {
+        settings.telegram = previousTelegram;
+    }
+});
+
 test('normalizeChannelSendRequest rejects invalid outbound type and channel', async () => {
     const { normalizeChannelSendRequest } = await import('../../src/messaging/send.js');
     assert.throws(

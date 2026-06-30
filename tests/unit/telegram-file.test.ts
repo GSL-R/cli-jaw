@@ -94,13 +94,14 @@ test('sendTelegramFile: succeeds on first attempt', async () => {
 
 // ─── sendTelegramFile: retry on 429 ───────────────────
 
-test('sendTelegramFile: retries on 429 then succeeds', async () => {
+test('sendTelegramFile: does not retry 429 locally', async () => {
     const bot = mockBot({ failTimes: 2, errorCode: 429 });
     const f = tmpFile(0);
     try {
         const r = await sendTelegramFile(bot, 123, f, 'document');
-        assert.equal(r.ok, true);
-        assert.equal(r.attempts, 3);
+        assert.equal(r.ok, false);
+        assert.equal(r.attempts, 1);
+        assert.equal(r.statusCode, 429);
     } finally { cleanup(f); }
 });
 
@@ -168,20 +169,20 @@ test('sendTelegramFile: gives up after max retries', async () => {
 
 // ─── sendTelegramFile: retry_after respected ──────────
 
-test('sendTelegramFile: 429 with retry_after=1 succeeds after wait', async () => {
+test('sendTelegramFile: reports retry_after without sleeping or retrying', async () => {
     const bot = mockBot({ failTimes: 1, errorCode: 429, retryAfter: 1 });
     const f = tmpFile(0);
     try {
         const r = await sendTelegramFile(bot, 123, f, 'document');
-        assert.equal(r.ok, true);
-        assert.equal(r.attempts, 2);
+        assert.equal(r.ok, false);
+        assert.equal(r.attempts, 1);
+        assert.equal(r.retryAfter, 1);
     } finally { cleanup(f); }
 });
 
 // ─── sendTelegramFile: retry cap paths ────────────────
 
-test('sendTelegramFile: bails when retry_after exceeds MAX_DELAY cap', async () => {
-    // retry_after=60s > MAX_DELAY_MS(30s) → immediate failure
+test('sendTelegramFile: preserves long retry_after for shared cooldown', async () => {
     const bot = mockBot({ failTimes: 3, errorCode: 429, retryAfter: 60 });
     const f = tmpFile(0);
     try {
@@ -189,7 +190,7 @@ test('sendTelegramFile: bails when retry_after exceeds MAX_DELAY cap', async () 
         assert.equal(r.ok, false);
         assert.equal(r.attempts, 1);
         assert.equal(r.statusCode, 429);
-        assert.ok(r.error?.includes('too large'));
+        assert.equal(r.retryAfter, 60);
     } finally { cleanup(f); }
 });
 
