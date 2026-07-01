@@ -142,7 +142,8 @@ export class TelegramDeliveryGuard {
         this.saveState();
     }
 
-    async run<T>(token: string, chatId: string, operation: () => Promise<T>): Promise<T> {
+    async run<T>(token: string, chatId: string, operation: () => Promise<T>, label = 'delivery'): Promise<T> {
+        const enqueuedAt = this.now();
         const tokenKey = this.tokenKey(token);
         const chatKey = `${tokenKey}:${chatId}`;
         const previous = this.tails.get(tokenKey) || Promise.resolve();
@@ -165,7 +166,16 @@ export class TelegramDeliveryGuard {
             const startedAt = this.now();
             this.lastGlobalStart.set(tokenKey, startedAt);
             this.lastChatStart.set(chatKey, startedAt);
-            return await operation();
+            try {
+                return await operation();
+            } finally {
+                const completedAt = this.now();
+                const queueWaitMs = Math.max(0, startedAt - enqueuedAt);
+                const durationMs = Math.max(0, completedAt - startedAt);
+                if (queueWaitMs >= 250 || durationMs >= 5000) {
+                    console.log(`[telegram:delivery] method=${label} queueWaitMs=${queueWaitMs} durationMs=${durationMs}`);
+                }
+            }
         } finally {
             release();
             if (this.tails.get(tokenKey) === tail) this.tails.delete(tokenKey);
@@ -183,7 +193,7 @@ export class TelegramDeliveryGuard {
                     this.recordCooldown(token, retryAfter);
                 }
                 return response;
-            });
+            }, method);
         };
     }
 }

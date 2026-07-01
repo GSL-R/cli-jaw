@@ -18,6 +18,12 @@ import { sendResultHttpStatus } from '../messaging/send-result.js';
 import { settings } from '../core/config.js';
 import { expandHomePath } from '../core/path-expand.js';
 import { stripUndefined } from '../core/strip-undefined.js';
+import {
+    beginDeliveryReceipt,
+    completeDeliveryReceipt,
+    getDeliveryReceipt,
+    isValidDeliveryId,
+} from '../messaging/delivery-receipts.js';
 
 function resolveTelegramChatId(body: Record<string, unknown>): string | number | null {
     const raw = body?.['chat_id'] ?? body?.['chatId'];
@@ -236,17 +242,61 @@ export function registerMessagingRoutes(app: Express, requireAuth: AuthMiddlewar
 
     // Canonical channel send
     app.post('/api/channel/send', requireAuth, async (req, res) => {
+        const requestedDeliveryId = req.body?.delivery_id ?? req.body?.deliveryId;
+        const deliveryId = requestedDeliveryId == null ? null : String(requestedDeliveryId);
+        if (deliveryId != null && !isValidDeliveryId(deliveryId)) {
+            res.status(400).json({ error: 'invalid_delivery_id' });
+            return;
+        }
         try {
-            const result = await sendChannelOutput(normalizeChannelSendRequest(req.body));
+            const normalized = normalizeChannelSendRequest(req.body);
+            if (deliveryId) {
+                const existing = getDeliveryReceipt(deliveryId);
+                if (existing) {
+                    res.status(existing.status === 'pending' ? 202 : 200).json({
+                        ok: existing.status === 'sent',
+                        deliveryId,
+                        receipt: existing,
+                        replayed: true,
+                    });
+                    return;
+                }
+                beginDeliveryReceipt(deliveryId, normalized);
+            }
+            const result = await sendChannelOutput(normalized);
+            const receipt = deliveryId
+                ? completeDeliveryReceipt(
+                    deliveryId,
+                    result.ok ? 'sent' : result['deferred'] ? 'deferred' : 'failed',
+                    result,
+                )
+                : null;
             if (!result.ok) {
-                res.status(sendResultHttpStatus(result)).json(result);
+                res.status(sendResultHttpStatus(result)).json({ ...result, ...(deliveryId && { deliveryId, receipt }) });
                 return;
             }
-            res.json(result);
+            res.json({ ...result, ...(deliveryId && { deliveryId, receipt }) });
         } catch (e: unknown) {
             console.error('[channel:send]', e);
+            if (deliveryId && getDeliveryReceipt(deliveryId)?.status === 'pending') {
+                completeDeliveryReceipt(deliveryId, 'failed', { error: (e as Error).message });
+            }
             res.status(httpStatus(e, 500)).json({ error: (e as Error).message, code: httpCode(e) });
         }
+    });
+
+    app.get('/api/channel/delivery/:id', requireAuth, (req, res) => {
+        const id = String(req.params['id'] || '');
+        if (!isValidDeliveryId(id)) {
+            res.status(400).json({ error: 'invalid_delivery_id' });
+            return;
+        }
+        const receipt = getDeliveryReceipt(id);
+        if (!receipt) {
+            res.status(404).json({ error: 'delivery_receipt_not_found' });
+            return;
+        }
+        res.json({ ok: receipt.status === 'sent', deliveryId: id, receipt });
     });
 
     app.post('/api/discord/send', requireAuth, async (req, res) => {
