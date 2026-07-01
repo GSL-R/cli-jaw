@@ -9,6 +9,7 @@ interface TelegramApiErrorLike {
     message?: string;
     parameters?: { retry_after?: number };
     constructor?: { name?: string };
+    error?: { code?: string; type?: string; constructor?: { name?: string } };
 }
 
 function asTgErr(err: unknown): TelegramApiErrorLike {
@@ -114,7 +115,13 @@ export async function sendTelegramFile(
             }
             if (!transient || attempt === MAX_RETRIES) {
                 const sc = transient ? classifyUpstreamError(err) : (e.error_code || e.statusCode || 500);
-                console.error(`[telegram:file] failed after ${attempt} attempt(s):`, e.message);
+                const cause = e.error;
+                console.error(
+                    `[telegram:file] failed after ${attempt} attempt(s):`,
+                    e.message,
+                    `cause=${cause?.constructor?.name || cause?.type || 'unknown'}`,
+                    `code=${cause?.code || 'unknown'}`,
+                );
                 return stripUndefined({
                     ok: false, attempts: attempt,
                     error: e.message || 'unknown error',
