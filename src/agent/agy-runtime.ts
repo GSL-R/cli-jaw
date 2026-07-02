@@ -18,6 +18,7 @@ export function isAgyTimeoutOutput(text: string): boolean {
 export function isAgyInternalToolTraceOutput(text: string): boolean {
     const value = String(text || '').trimStart();
     if (!value) return false;
+    if (/^my_tool_call_analysis\s*:/i.test(value)) return true;
     const startsAsTrace = /^(?:🔮\s*)?(?:toolAction|toolSummary)\s*:/i.test(value)
         || /^Lands\s+toolAction\s*=/i.test(value);
     if (!startsAsTrace) return false;

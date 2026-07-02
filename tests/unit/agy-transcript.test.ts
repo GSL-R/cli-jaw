@@ -185,6 +185,11 @@ test('AGY-TR-013: classifyAgyTranscriptRow separates final planner rows from int
     assert.equal(classifyAgyTranscriptRow(JSON.stringify({
         type: 'PLANNER_RESPONSE', status: 'DONE', content: '',
     })).kind, 'planner');
+    // AGY may serialize a pending tool call into planner prose before compaction.
+    assert.equal(classifyAgyTranscriptRow(JSON.stringify({
+        type: 'PLANNER_RESPONSE', status: 'DONE',
+        content: 'my_tool_call_analysis:\n- Tool: run_command\n- Arguments: backup',
+    })).kind, 'planner');
     // Meta rows and tools.
     assert.equal(classifyAgyTranscriptRow(JSON.stringify({ type: 'USER_INPUT', content: 'q' })).kind, 'meta');
     assert.equal(classifyAgyTranscriptRow(JSON.stringify({ type: 'SYSTEM_MESSAGE', content: 's' })).kind, 'meta');

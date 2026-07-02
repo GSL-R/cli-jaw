@@ -73,6 +73,13 @@ test('AGY-RT-002c: detects leaked internal tool-planning output', () => {
         '<truncated 92507 bytes>',
     ].join('\n');
     assert.equal(isAgyInternalToolTraceOutput(leaked), true);
+    assert.equal(isAgyInternalToolTraceOutput([
+        'my_tool_call_analysis:',
+        '- Tool: run_command',
+        '- toolAction: 백업 실행',
+        '- Arguments:',
+        '  - CommandLine: "python3 backup.py"',
+    ].join('\n')), true);
     assert.equal(isAgyInternalToolTraceOutput("toolAction이라는 문자열을 분석한 정상 답변이에요."), false);
     assert.equal(isAgyInternalToolTraceOutput('정상적인 최종 답변입니다.'), false);
     assert.match(AGY_TOOL_TRACE_FAILURE_MESSAGE, /without a user-facing final answer/);
@@ -469,7 +476,7 @@ test('AGY-RT-015: transcript watcher drives the final planner flag and growth ac
     assert.match(watcherSrc, /options\.onCheckpointStall\?\.\(/);
     // Fast-resume regression: a USER_INPUT row must clear a stale final-planner flag set
     // by the previous turn's row inside the lookback buffer.
-    assert.match(watcherSrc, /rowType === 'USER_INPUT'/);
+    assert.match(watcherSrc, /rowType === 'USER_INPUT' \|\| rowType === 'CHECKPOINT'/);
 });
 
 test('AGY-RT-016: AGY unresolved transcript provider error is finalized before smoke and lifecycle', () => {

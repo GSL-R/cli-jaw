@@ -284,6 +284,7 @@ export function classifyAgyTranscriptRow(line: string): { kind: AgyTranscriptRow
     }
     if (type === 'PLANNER_RESPONSE') {
         const content = typeof row['content'] === 'string' ? row['content'].trim() : '';
+        if (/^my_tool_call_analysis\s*:/i.test(content)) return { kind: 'planner' };
         return { kind: content && hasEmptyToolCalls(row) ? 'final-planner' : 'planner' };
     }
     if (NON_TOOL_TYPES.has(type)) return { kind: 'meta' };

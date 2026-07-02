@@ -68,7 +68,7 @@ function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs:
     }
     // A USER_INPUT row marks the current turn's start: any final-planner flag set by a
     // previous turn's row that slipped inside the lookback buffer (fast resume) is stale.
-    if (rowType === 'USER_INPUT') {
+    if (rowType === 'USER_INPUT' || rowType === 'CHECKPOINT') {
         ctx.agyFinalPlannerSeen = false;
         ctx.agyFinalPlannerText = undefined;
         ctx.agyLastTranscriptError = undefined;
