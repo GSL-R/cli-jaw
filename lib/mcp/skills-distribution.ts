@@ -10,15 +10,11 @@ import { execSync } from 'child_process';
 import {
     JAW_HOME,
     shouldSkipClone, writeCloneMeta, CLONE_TIMEOUT_MS,
-    CODEX_ACTIVE, OPENCLAW_ACTIVE,
+    CODEX_ACTIVE, resolveAutoActivateSkills,
     copyDirRecursive, findPackageRoot,
     loadRegistry, getSkillVersion, shouldUpdateSkillDirectory,
     isDiscoverableSkillDirName, isSkillSourceEntryName, shouldUseLocalSkillsSource,
 } from './skills-utils.js';
-
-type SkillRegistry = {
-    skills?: Record<string, { category?: string }>;
-};
 
 /**
  * Phase 6 — 2×3 Skill Classification at Install
@@ -193,19 +189,8 @@ export function copyDefaultSkills() {
     }
 
     // ─── 3. Auto-activate from refDir ───────────────
-    // Promotes CODEX_ACTIVE + OPENCLAW_ACTIVE from ref → active
-    // (fallback for devices without ~/.codex/skills/)
-    // Orchestration v2: registry에서 category=orchestration인 스킬도 자동 활성화
-    try {
-        const registryPath = join(refDir, 'registry.json');
-        if (fs.existsSync(registryPath)) {
-            const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8')) as SkillRegistry;
-            for (const [id, meta] of Object.entries(registry.skills || {})) {
-                if (meta.category === 'orchestration') OPENCLAW_ACTIVE.add(id);
-            }
-        }
-    } catch { /* registry parse error — skip */ }
-    const AUTO_ACTIVATE = new Set([...CODEX_ACTIVE, ...OPENCLAW_ACTIVE]);
+    // Uses project defaults unless the instance defines an allowlist policy.
+    const AUTO_ACTIVATE = resolveAutoActivateSkills(refDir);
     let autoCount = 0;
     for (const id of AUTO_ACTIVATE) {
         const src = join(refDir, id);
@@ -256,16 +241,7 @@ export function propagateSkillsToInstances() {
     const srcRefReg = loadRegistry(baseRef);
 
     // Build auto-activate set (same logic as copyDefaultSkills)
-    const autoActivate = new Set([...CODEX_ACTIVE, ...OPENCLAW_ACTIVE]);
-    try {
-        const registryPath = join(baseRef, 'registry.json');
-        if (fs.existsSync(registryPath)) {
-            const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8')) as SkillRegistry;
-            for (const [id, meta] of Object.entries(registry.skills || {})) {
-                if (meta.category === 'orchestration') autoActivate.add(id);
-            }
-        }
-    } catch { /* skip */ }
+    const autoActivate = resolveAutoActivateSkills(baseRef);
 
     for (const instDir of instances) {
         const instRef = join(instDir, 'skills_ref');

@@ -8,14 +8,11 @@ import { execSync } from 'child_process';
 import {
     JAW_HOME,
     shouldSkipClone, writeCloneMeta, CLONE_TIMEOUT_MS,
-    CODEX_ACTIVE, OPENCLAW_ACTIVE,
+    resolveAutoActivateSkills,
     copyDirRecursive, findPackageRoot,
     isDiscoverableSkillDirName, isSkillSourceEntryName, shouldUseLocalSkillsSource,
 } from './skills-utils.js';
 
-type SkillRegistry = {
-    skills?: Record<string, { category?: string }>;
-};
 import {
     ensureWorkingDirSkillsLinks,
     createBackupContext,
@@ -118,16 +115,7 @@ export function softResetSkills() {
     }
 
     // 3. Build autoActivate set before touching active dir
-    const autoActivate = new Set([...CODEX_ACTIVE, ...OPENCLAW_ACTIVE]);
-    try {
-        const regPath = join(refDir, 'registry.json');
-        if (fs.existsSync(regPath)) {
-            const reg = JSON.parse(fs.readFileSync(regPath, 'utf8')) as SkillRegistry;
-            for (const [id, meta] of Object.entries(reg.skills || {})) {
-                if (meta.category === 'orchestration') autoActivate.add(id);
-            }
-        }
-    } catch { /* registry parse error — skip */ }
+    const autoActivate = resolveAutoActivateSkills(refDir);
 
     // 4. active skills: update from ref, remove non-active (keep pure custom)
     let restored = 0;

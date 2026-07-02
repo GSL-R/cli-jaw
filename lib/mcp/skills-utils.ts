@@ -81,6 +81,32 @@ export const OPENCLAW_ACTIVE = new Set([
     'desktop-control', 'goal',
 ]);
 
+type SkillActivationPolicy = {
+    mode?: 'allowlist';
+    skills?: unknown;
+};
+
+/** Resolve default active skills, optionally narrowed by a per-instance allowlist. */
+export function resolveAutoActivateSkills(refDir: string): Set<string> {
+    const policyPath = join(JAW_HOME, 'data', 'skill_activation_policy.json');
+    try {
+        const policy = JSON.parse(fs.readFileSync(policyPath, 'utf8')) as SkillActivationPolicy;
+        if (policy.mode === 'allowlist' && Array.isArray(policy.skills)) {
+            return new Set(policy.skills.filter((id): id is string =>
+                typeof id === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(id)));
+        }
+    } catch { /* absent or invalid policy falls back to project defaults */ }
+
+    const autoActivate = new Set([...CODEX_ACTIVE, ...OPENCLAW_ACTIVE]);
+    try {
+        const registry = loadRegistry(refDir);
+        for (const [id, meta] of Object.entries(registry.skills || {})) {
+            if (meta["category"] === 'orchestration') autoActivate.add(id);
+        }
+    } catch { /* registry parse error — keep static defaults */ }
+    return autoActivate;
+}
+
 /** Walk up from current file to find package.json → package root */
 export function findPackageRoot(): string {
     let dir = dirname(fileURLToPath(import.meta.url));

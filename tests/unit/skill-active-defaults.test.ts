@@ -32,6 +32,33 @@ test('active defaults include search, structured-renderers, and goal', () => {
     assert.equal(OPENCLAW_ACTIVE.has('goal'), true);
 });
 
+test('per-instance allowlist overrides default and orchestration activation', () => {
+    const home = fs.mkdtempSync(join(os.tmpdir(), 'jaw-skill-policy-home-'));
+    try {
+        const base = join(home, '.cli-jaw');
+        const ref = join(base, 'skills_ref');
+        fs.mkdirSync(join(base, 'data'), { recursive: true });
+        fs.mkdirSync(ref, { recursive: true });
+        makeRegistry(ref, ['search', 'goal', 'dev']);
+        fs.writeFileSync(join(base, 'data', 'skill_activation_policy.json'), JSON.stringify({
+            mode: 'allowlist',
+            skills: ['search', 'memory', '../invalid'],
+        }));
+
+        const output = runNodeEval(`
+            const { resolveAutoActivateSkills } = await import('./lib/mcp/skills-utils.ts');
+            console.log(JSON.stringify([...resolveAutoActivateSkills(${JSON.stringify(ref)})].sort()));
+        `, {
+            HOME: home,
+            CLI_JAW_HOME: base,
+        });
+
+        assert.deepEqual(JSON.parse(output.trim()), ['memory', 'search']);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test('propagation activates defaults from instance skills_ref and preserves custom active skills', () => {
     const home = fs.mkdtempSync(join(os.tmpdir(), 'jaw-active-defaults-home-'));
     try {
