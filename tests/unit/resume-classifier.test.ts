@@ -2,6 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { shouldInvalidateResumeSession } from '../../src/agent/resume-classifier.ts';
 
+test('agy exit 0 conversation-not-found warning invalidates native resume', () => {
+    assert.equal(shouldInvalidateResumeSession(
+        'agy',
+        0,
+        '',
+        'Warning: conversation "12345678-1234-1234-1234-123456789abc" not found',
+    ), true);
+});
+
 test('resume classifier invalidates explicit stale Claude session errors', () => {
     const invalid = shouldInvalidateResumeSession(
         'claude',

@@ -1,6 +1,7 @@
 // Resume/heartbeat/bucket decision helpers — pure functions, no spawn state mutation.
 
 import { normalizeModelForCli } from '../../core/config.js';
+import type { AgyCapabilities } from '../agy-capabilities.js';
 
 // ─── ACP Heartbeat Helper ────────────────────────────
 // Pure function for conditional heartbeat gating.
@@ -60,6 +61,13 @@ export function shouldResumeBucketSession(
 
 export const GEMINI_RESUME_TTL_MS = 72 * 60 * 60 * 1000;
 export const AGY_RESUME_TTL_MS = 72 * 60 * 60 * 1000;
+
+export function shouldEnableAgyNativeResume(
+    perCliConfig: Record<string, unknown> | null | undefined,
+    capabilities: Pick<AgyCapabilities, 'conversation'> | null | undefined,
+): boolean {
+    return perCliConfig?.['nativeResume'] === true && capabilities?.conversation === true;
+}
 
 function normalizeGeminiResumeModel(model: string | null | undefined): string {
     const normalized = String(model || '').trim().toLowerCase();

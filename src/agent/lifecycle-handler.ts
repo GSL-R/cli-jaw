@@ -420,14 +420,16 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
         }
     }
 
-    // ─── Kiro stale resume on exit 0 (stdout carries "no saved chat sessions", etc.) ───
+    // ─── Stale resume on exit 0 (provider prints a warning as a successful result) ───
     // Only inspect the CLI diagnostic channels (stderr + assistant body) — never tool
     // output (ctx.traceLog), which is arbitrary content that can quote stale phrases.
     // A genuine stale resume does ZERO work, so require an empty toolLog: a turn that
     // actually ran tools must never be reclassified as stale and silently discarded.
     const kiroDiagnosticText = `${ctx.stderrBuf}\n${ctx.fullText}`;
+    const staleSuccessResume = (cli === 'agy' || isKiroPlainTextCli(cli, effectiveProvider))
+        && shouldInvalidateResumeSession(runtimeCli, code, ctx.stderrBuf, kiroDiagnosticText);
     if (
-        isKiroPlainTextCli(cli, effectiveProvider)
+        (cli === 'agy' || isKiroPlainTextCli(cli, effectiveProvider))
         && isResume
         && mainManaged
         && !opts.internal
@@ -438,13 +440,13 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
         && !wasSteer
         && (code === 0 || code === null)
         && ctx.toolLog.length === 0
-        && shouldInvalidateResumeSession(runtimeCli, code, ctx.stderrBuf, kiroDiagnosticText)
+        && staleSuccessResume
     ) {
         const bucket = resolveSessionBucket(cli, model, effectiveProvider);
         if (bucket) {
             try { clearSessionBucket.run(bucket); } catch { /* ignore */ }
         }
-        console.log('[jaw:kiro] stale resume detected on success exit — retrying fresh with history');
+        console.log(`[jaw:${cli}] stale resume detected on success exit — retrying fresh with history`);
         try {
             const { peekPendingBootstrapPrompt } = await import('../core/main-session.js');
             if (!peekPendingBootstrapPrompt()) {
@@ -455,10 +457,10 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
         broadcast('agent_retry', {
             cli,
             delay: 0,
-            reason: 'kiro stale resume — fresh with history',
+            reason: `${cli} stale resume — fresh with history`,
             ...empTag,
         }, isEmployee ? 'internal' : 'public');
-        finalizeTraceRun(ctx.traceRunId, 'error', 'kiro stale resume');
+        finalizeTraceRun(ctx.traceRunId, 'error', `${cli} stale resume`);
         const { promise: retryP } = _spawnAgent(prompt, {
             ...opts,
             _skipResume: true,
@@ -467,7 +469,7 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
         });
         retryP.then(resolve).catch(() => {
             broadcast('agent_done', { ...runTag(ctx),
-                text: '❌ kiro stale resume and fresh retry failed',
+                text: `❌ ${cli} stale resume and fresh retry failed`,
                 error: true,
                 origin,
                 ...empTag,

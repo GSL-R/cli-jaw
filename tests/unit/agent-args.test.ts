@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { formatAgyPrintTimeout, resolveAgyAddDirectories, resolveGeminiIncludeDirectories } from '../../src/agent/args.ts';
 import { buildAiERuntimeStatusMeta, buildArgs, buildResumeArgs, resolveAiEProvider, resolveSessionBucket, shouldResumeBucketSession } from '../../src/agent/spawn.ts';
+import { shouldEnableAgyNativeResume } from '../../src/agent/spawn/resume.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -74,6 +75,13 @@ test('AG-000e: agy resume uses exact native conversation id with print mode', ()
     assert.ok(args.includes('--conversation'));
     assert.ok(args.includes('--model'));
     assert.ok(!args.includes('--output-format'));
+});
+
+test('AG-000e2: agy native resume requires both opt-in and runtime capability', () => {
+    assert.equal(shouldEnableAgyNativeResume({ nativeResume: true }, { conversation: true }), true);
+    assert.equal(shouldEnableAgyNativeResume({ nativeResume: false }, { conversation: true }), false);
+    assert.equal(shouldEnableAgyNativeResume({ nativeResume: true }, { conversation: false }), false);
+    assert.equal(shouldEnableAgyNativeResume(undefined, { conversation: true }), false);
 });
 
 test('AG-000f: agy supports per-run log file capture for print-mode session ids', () => {

@@ -762,7 +762,7 @@ import { AcpClient } from '../cli/acp-client.js';
 import { CodexAppClient } from './codex-app-client.js';
 import { extractFromCodexAppEvent } from './codex-app-events.js';
 
-import { shouldEmitHeartbeat, shouldResumeBucketSession, GEMINI_RESUME_TTL_MS } from './spawn/resume.js';
+import { shouldEmitHeartbeat, shouldEnableAgyNativeResume, shouldResumeBucketSession, GEMINI_RESUME_TTL_MS } from './spawn/resume.js';
 export { shouldEmitHeartbeat, shouldResumeBucketSession, GEMINI_RESUME_TTL_MS };
 import { createQueueController, FALLBACK_MAX_RETRIES } from './spawn/queue.js';
 export type { QueueController } from './spawn/queue.js';
@@ -1073,15 +1073,24 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
     const envDefaultsCli = cli === 'ai-e' ? effectiveProvider : cli;
     const cliEnv = applyCliEnvDefaults(envDefaultsCli, opts.env);
     const spawnEnv = makeCleanEnv(cliEnv);
+    const agyBinaryForCapabilities = cli === 'agy'
+        ? (detectCli('agy').path || 'agy')
+        : null;
+    const agyCapabilities = agyBinaryForCapabilities
+        ? detectAgyCapabilities(agyBinaryForCapabilities)
+        : undefined;
     const bucketRow = currentBucket ? getSessionBucket.get(currentBucket) as SessionBucketRow | undefined : null;
     const bucketSessionId = bucketRow?.session_id || null;
     const bucketModel = typeof bucketRow?.model === 'string' ? bucketRow.model : null;
     const bucketResumeKey = typeof bucketRow?.resume_key === 'string' ? bucketRow.resume_key : null;
     const bucketUpdatedAt = bucketRow?.updated_at ?? null;
     const resumeKey = buildSessionResumeKey(cli, spawnEnv);
-    // AGY native resume can replay prior stdout and continue stale mid-turn planner
-    // state. cli-jaw keeps safer cross-turn context via DB history instead.
-    const providerSupportsResume = cli !== 'agy'
+    // AGY native resume is opt-in while replay/stale-planner behavior completes
+    // its local pilot. Capability gating prevents silent history loss when an
+    // installed AGY build does not support --conversation.
+    const agyNativeResumeEnabled = cli === 'agy'
+        && shouldEnableAgyNativeResume(cfg, agyCapabilities);
+    const providerSupportsResume = (cli !== 'agy' || agyNativeResumeEnabled)
         && !(cli === 'ai-e' && effectiveProvider !== 'claude' && effectiveProvider !== 'kiro' && effectiveProvider !== 'codex' && effectiveProvider !== 'grok');
     const canResumeBucketSession = !bucketSessionId || shouldResumeBucketSession(
         cli,
@@ -1234,12 +1243,6 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ? formatAgyPrintTimeout(resolvedAgyPrintTimeoutMs)
         : undefined;
     let spawnCwd = settings["workingDir"];
-    const agyBinaryForCapabilities = cli === 'agy'
-        ? (detectCli('agy').path || 'agy')
-        : null;
-    const agyCapabilities = agyBinaryForCapabilities
-        ? detectAgyCapabilities(agyBinaryForCapabilities)
-        : undefined;
     if (agyCapabilities?.usedFallback && agyBinaryForCapabilities && !warnedAgyCapabilityFallbacks.has(agyBinaryForCapabilities)) {
         warnedAgyCapabilityFallbacks.add(agyBinaryForCapabilities);
         console.warn('[agy-capabilities] probe failed; using legacy emit-all argv compatibility');

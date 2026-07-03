@@ -1,4 +1,5 @@
 import { isKiroStaleSessionOutput } from './kiro-runtime.js';
+import { isAgyStaleSessionOutput } from './agy-runtime.js';
 
 type MatcherMap = Record<string, RegExp[]>;
 
@@ -65,6 +66,9 @@ export function shouldInvalidateResumeSession(
     resultText = '',
 ): boolean {
     if (code === 0) {
+        if (cli === 'agy') {
+            return isAgyStaleSessionOutput(`${stderr}\n${resultText}`);
+        }
         if (cli === 'kiro-code' || cli === 'kiro') {
             return isKiroStaleSessionOutput(`${stderr}\n${resultText}`);
         }
