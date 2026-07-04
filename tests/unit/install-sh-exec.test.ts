@@ -32,7 +32,7 @@ export CLI_JAW_SOURCE_ONLY=1
 source ${JSON.stringify(installerPath)}
 ${snippet}
 `;
-    const result = spawnSync('bash', ['-lc', script], {
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-c', script], {
         encoding: 'utf8',
         env: {
             ...process.env,
