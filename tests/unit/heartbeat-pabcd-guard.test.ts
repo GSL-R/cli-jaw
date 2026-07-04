@@ -25,7 +25,11 @@ test('heartbeat defers while the main agent is busy', () => {
     const busyIdx = heartbeatSrc.indexOf('isAgentBusy()');
     const collectIdx = heartbeatSrc.indexOf('orchestrateAndCollect(prompt');
 
-    assert.ok(heartbeatSrc.includes("import { isAgentBusy, messageQueue } from '../agent/spawn.js'"));
+    assert.match(
+        heartbeatSrc,
+        /import\s*\{[^}]*\bisAgentBusy\b[^}]*\bmessageQueue\b[^}]*\}\s*from '\.\.\/agent\/spawn\.js'/s,
+        'heartbeat must import main-agent busy state and the user queue',
+    );
     assert.ok(heartbeatSrc.includes("'agent_busy'"), 'agent-busy defer reason must be structured');
     assert.ok(busyIdx > -1, 'heartbeat must check isAgentBusy before starting');
     assert.ok(collectIdx > -1, 'heartbeat must still call orchestrateAndCollect for IDLE runs');
@@ -41,7 +45,11 @@ test('heartbeat drain respects main-agent and user-queue priority', () => {
     const drainIdx = heartbeatSrc.indexOf('export async function drainPending');
     const drainBlock = heartbeatSrc.slice(drainIdx, drainIdx + 500);
 
-    assert.ok(heartbeatSrc.includes("import { hasPendingWorkerReplays } from '../orchestrator/worker-registry.js'"));
+    assert.match(
+        heartbeatSrc,
+        /import\s*\{[^}]*\bhasPendingWorkerReplays\b[^}]*\}\s*from '\.\.\/orchestrator\/worker-registry\.js'/s,
+        'heartbeat must import pending worker replay state',
+    );
     assert.ok(drainIdx > -1, 'drainPending must exist');
     assert.ok(
         drainBlock.includes('isAgentBusy() || messageQueue.length > 0 || hasPendingWorkerReplays()'),
