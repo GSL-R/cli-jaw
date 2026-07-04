@@ -1,6 +1,7 @@
 // Claude CLI event adapter (claude, claude-e, ai-e)
 
 import { fieldString } from '../../types/cli-events.js';
+import { updateTraceToolRow, getTraceEvent } from '../../trace/store.js';
 import type { CliEventRecord } from './types.js';
 import type { SpawnContext, ToolEntry } from './types.js';
 import {
@@ -216,10 +217,32 @@ export function handleClaudeEvent(
             const segment = appendClaudeISnapshotText(ctx, evt);
             ctx.pendingOutputChunk = (ctx.pendingOutputChunk || '') + segment;
         } else if (ctx.claudeStreamedText) {
-            // text_delta already streamed this prose live (index.ts stream_event);
-            // re-appending the complete block would double it (260612 audit 07 F-T4).
-            // Reset the per-message flag so the next assistant message starts clean.
+            // Reconcile the raw-streamed region with the canonical complete block via
+            // the segment formatter: restores the '\n- ' boundary between
+            // tool-separated messages (codex/claude-e parity) without re-appending
+            // (260612 audit 07 F-T4 no-doubling — replace, never append) and without
+            // mid-token corruption (the canonical block is complete text, not a token).
+            const hasCanonicalText = evt.message.content.some(
+                (block) => block.type === 'text' && block.text,
+            );
+            if (ctx.claudeStreamedTextStart !== undefined && hasCanonicalText) {
+                const useLive = ctx.liveOutputText !== undefined;
+                const target = useLive ? ctx.liveOutputText! : ctx.fullText;
+                if (ctx.claudeStreamedTextStart <= target.length) {
+                    const truncated = target.slice(0, ctx.claudeStreamedTextStart);
+                    if (useLive) ctx.liveOutputText = truncated;
+                    else ctx.fullText = truncated;
+                    // Re-derive so the formatter's first-output branch keeps a plain
+                    // first message unbulleted.
+                    ctx.outputTextStarted = truncated.trim().length > 0;
+                    for (const block of evt.message.content) {
+                        if (block.type === 'text') appendAssistantTextSegment(ctx, block.text);
+                    }
+                }
+            }
+            // Reset the per-message state so the next assistant message starts clean.
             ctx.claudeStreamedText = false;
+            ctx.claudeStreamedTextStart = undefined;
         } else {
             // Fallback: no partial text stream seen (e.g. --include-partial-messages
             // absent) → surface the complete assistant text block here.
@@ -259,7 +282,36 @@ export function handleClaudeEvent(
                             : resultText;
                     }
                     syncLiveTools(ctx);
+                    updateTraceToolRow(existing);
                     emitAgentTool(ctx, agentLabel, existing, empTag);
+                } else {
+                    // RAM cap evicted the placeholder — converge the durable row via
+                    // the stamp-time index so trace state still reaches final
+                    // status (WP4, devlog 260703 doc 12 item 3).
+                    const pointer = ctx.toolTraceIndex?.get(`claude:tooluse:${block.tool_use_id}`);
+                    if (pointer) {
+                        let base: Partial<ToolEntry> = {};
+                        const row = getTraceEvent(pointer.traceRunId, pointer.traceSeq);
+                        if (row?.raw) {
+                            try { base = JSON.parse(row.raw) as Partial<ToolEntry>; } catch { /* keep minimal base */ }
+                        }
+                        const resultText = extractText(block.content);
+                        const merged: ToolEntry = {
+                            toolType: 'tool',
+                            label: 'tool',
+                            ...base,
+                            icon: block["is_error"] ? '❌' : '✅',
+                            status: block["is_error"] ? 'error' : 'done',
+                            traceRunId: pointer.traceRunId,
+                            traceSeq: pointer.traceSeq,
+                        };
+                        if (resultText && !merged.detail) {
+                            merged.detail = resultText.length > 500
+                                ? resultText.slice(0, 497) + '...'
+                                : resultText;
+                        }
+                        updateTraceToolRow(merged);
+                    }
                 }
             }
         }

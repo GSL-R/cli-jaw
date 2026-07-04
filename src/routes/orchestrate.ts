@@ -3,6 +3,7 @@ import type { AuthMiddleware } from './types.js';
 import { fail } from '../http/response.js';
 import { isAgentBusy, messageQueue, getQueuedMessageSnapshotForScope, removeQueuedMessage, killActiveAgent, waitForProcessEnd, getCurrentMainMeta, getSteerWaitMsForActiveAgent, setQueueHold, clearQueueHold, setSteerInProgress, isSteerInProgress } from '../agent/spawn.js';
 import { getLiveRun } from '../agent/live-run-state.js';
+import { countToolTraceRows, listToolEntriesForRun } from '../trace/store.js';
 import { orchestrate, orchestrateContinue, orchestrateReset, isResetIntent, isContinueIntent, drainPendingReplays } from '../orchestrator/pipeline.js';
 import { getSession, insertMessage } from '../core/db.js';
 import { getActiveChatSession } from '../core/chat-sessions.js';
@@ -40,10 +41,10 @@ import { stripUndefined } from '../core/strip-undefined.js';
 import { verifyBossToken } from '../core/boss-auth.js';
 import { buildVirtualEmployeeRow, resolveDispatchableEmployee, checkRuntimeHints, checkModelSupport } from '../core/employees.js';
 import type { EmployeeRow, SyntheticEmployeeRow } from '../core/employees.js';
-import { CLI_REGISTRY } from '../cli/registry.js';
+import { resolveCliDefaultModel } from '../cli/opencodex-models.js';
 import { resolveMainCli } from '../core/main-session.js';
 import { getHeartbeatRuntimeState } from '../memory/heartbeat.js';
-import { sanitizeToolLogForDurableStorage } from '../shared/tool-log-sanitize.js';
+import { sanitizeToolLogForDurableStorage, isToolLogOverflowMarker } from '../shared/tool-log-sanitize.js';
 import { getSecurityAuditLog } from '../security/security-audit-log.js';
 import { validateDispatchTask } from '../workflows/employee-boundary.js';
 import { normalizeScope, postDispatchDiffCheck } from '../workflows/scope-sandbox.js';
@@ -57,25 +58,39 @@ function getRuntimeSnapshot() {
     };
 }
 
+// WP4 (devlog 260703 doc 12): the RAM toolLog is a capped cache (160 newest) that
+// dies with the process; trace_events is authoritative. When RAM is empty or behind,
+// rebuild the boss tools from the durable rows (bounded newest-N read) and keep the
+// RAM-only isEmployee mirrors, then reapply the standard sanitize caps.
 function getSafeLiveRun(scope: string) {
     const liveRun = getLiveRun(scope);
-    return {
-        ...liveRun,
-        toolLog: sanitizeToolLogForDurableStorage(liveRun.toolLog),
-    };
+    let toolLog = sanitizeToolLogForDurableStorage(liveRun.toolLog);
+    if (liveRun.running && liveRun.traceRunId) {
+        const bossCount = toolLog.filter(t => t.isEmployee !== true && !isToolLogOverflowMarker(t)).length;
+        const ramBehind = toolLog.length === 0
+            || toolLog.some(isToolLogOverflowMarker)
+            || countToolTraceRows(liveRun.traceRunId) > bossCount;
+        if (ramBehind) {
+            const boss = listToolEntriesForRun(liveRun.traceRunId);
+            if (boss.length > bossCount) {
+                const mirrors = toolLog.filter(t => t.isEmployee === true);
+                toolLog = sanitizeToolLogForDurableStorage([...boss, ...mirrors]);
+            }
+        }
+    }
+    return { ...liveRun, toolLog };
 }
 
 function requestText(value: unknown): string {
     return typeof value === 'string' ? value.trim() : '';
 }
 
-function resolveVirtualDefaults(cliValue: unknown, modelValue: unknown): { cli: string; model: string } {
+async function resolveVirtualDefaults(cliValue: unknown, modelValue: unknown): Promise<{ cli: string; model: string }> {
     const requestedCli = requestText(cliValue);
     const cli = requestedCli || resolveMainCli(null, settings, getSession() as { active_cli?: string | null } | null);
-    const registryEntry = CLI_REGISTRY[cli as keyof typeof CLI_REGISTRY];
     return {
         cli,
-        model: requestText(modelValue) || registryEntry?.defaultModel || 'default',
+        model: requestText(modelValue) || await resolveCliDefaultModel(cli),
     };
 }
 
@@ -93,15 +108,15 @@ function resolveDispatchProjectRoot(dispatchCtx: ReturnType<typeof getCtx> | nul
         || process.cwd();
 }
 
-function resolveDispatchTarget(
+async function resolveDispatchTarget(
     input: Record<string, unknown>,
     emps: readonly EmployeeRow[],
-): {
+): Promise<{
     targetName: string;
     emp: EmployeeRow | SyntheticEmployeeRow;
     source: 'db' | 'static' | 'virtual';
-    staticSpec: ReturnType<typeof resolveDispatchableEmployee> | null;
-} | { error: string } {
+    staticSpec: Awaited<ReturnType<typeof resolveDispatchableEmployee>> | null;
+} | { error: string }> {
     const agentName = requestText(input["agent"]);
     const virtualName = requestText(input["virtual"]);
     if ((agentName && virtualName) || (!agentName && !virtualName)) {
@@ -113,17 +128,17 @@ function resolveDispatchTarget(
             role: input["role"],
             cli: input["cli"],
             model: input["model"],
-        }, resolveVirtualDefaults(input["cli"], input["model"]));
+        }, await resolveVirtualDefaults(input["cli"], input["model"]));
         return { targetName: emp.name, emp, source: 'virtual', staticSpec: null };
     }
 
     let emp = findEmployee(emps as EmployeeRow[], { agent: agentName }) as EmployeeRow | SyntheticEmployeeRow | null;
-    let staticSpec: ReturnType<typeof resolveDispatchableEmployee> | null = null;
+    let staticSpec: Awaited<ReturnType<typeof resolveDispatchableEmployee>> | null = null;
     if (!emp) {
-        staticSpec = resolveDispatchableEmployee(agentName, emps);
+        staticSpec = await resolveDispatchableEmployee(agentName, emps);
         if (staticSpec) emp = staticSpec.row;
     } else {
-        staticSpec = resolveDispatchableEmployee(emp.name, emps);
+        staticSpec = await resolveDispatchableEmployee(emp.name, emps);
     }
     if (!emp) return { error: `Employee not found: ${agentName}` };
     return { targetName: agentName, emp, source: staticSpec?.source ?? 'db', staticSpec };
@@ -364,7 +379,7 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
         }
 
         const emps = getEmployees.all() as EmployeeRow[];
-        const target = resolveDispatchTarget(req.body || {}, emps);
+        const target = await resolveDispatchTarget(req.body || {}, emps);
         if ('error' in target) {
             const status = target.error.startsWith('Employee not found:') ? 404 : 400;
             return fail(res, status, target.error);
@@ -424,7 +439,15 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
                 });
                 return;
             }
-            throw err;
+            console.error('[orchestrate] worker claim failed:', err);
+            const message = (err as Error)?.message || String(err);
+            res.status(500).json({
+                ok: false,
+                error: 'worker_claim_failed',
+                message,
+                hint: 'Run-id/registry failure before spawn — see server log.',
+            });
+            return;
         }
 
         // Detect client abort: hook the RESPONSE's 'close' (not request's) and
@@ -628,7 +651,7 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
                 try { normalizeScope(resolveDispatchProjectRoot(dispatchCtx), scope); }
                 catch (e) { return fail(res, 400, (e as Error).message); }
             }
-            const target = resolveDispatchTarget(item || {}, emps);
+            const target = await resolveDispatchTarget(item || {}, emps);
             if ('error' in target) {
                 const status = target.error.startsWith('Employee not found:') ? 404 : 400;
                 return fail(res, status, `Invalid entry: ${target.error}`);
@@ -650,14 +673,16 @@ export function registerOrchestrateRoutes(app: Express, requireAuth: AuthMiddlew
         validateParallelSafety(agentPhases);
         const parallelResolved = new Map(agentPhases.map((ap, i) => [i, ap.parallel]));
 
-        const runOne = async (entry: BatchEntry): Promise<{ agent: string; ok: boolean; runId?: string; status?: string; preview?: string; recoveryCommand?: string; outputBytes?: number; error?: string }> => {
+        const runOne = async (entry: BatchEntry): Promise<{ agent: string; ok: boolean; runId?: string; status?: string; preview?: string; recoveryCommand?: string; outputBytes?: number; error?: string; message?: string }> => {
             let slot;
             try { slot = claimWorker(entry.emp, entry.task, replayMeta); }
             catch (err) {
                 if (err instanceof WorkerBusyError) {
                     return { agent: entry.agentName, ok: false, error: `worker_busy: ${entry.agentName} is already running` };
                 }
-                throw err;
+                console.error('[orchestrate] worker claim failed:', err);
+                const message = (err as Error)?.message || String(err);
+                return { agent: entry.agentName, ok: false, error: 'worker_claim_failed', message };
             }
             try {
                 let enrichedTask = entry.task;

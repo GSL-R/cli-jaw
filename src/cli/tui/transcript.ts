@@ -11,6 +11,12 @@ export interface TranscriptState {
     liveTools: LiveToolItem[];
     liveToolsExpanded: boolean;
     committedToolRefs: Set<string>;
+    /** 260703 CJ-WP3 — per-turn dedup for stepRef-LESS tool commits (key =
+     *  `fallback:agentId:label`). agent-done replays the whole toolLog, and a
+     *  stepRef-less tool already committed live was re-appended (the live
+     *  entry that used to absorb the key was consumed). Cleared per user turn:
+     *  the same label must commit fresh next turn. */
+    committedFallbackKeys: Set<string>;
 }
 
 export interface LiveToolItem {
@@ -36,10 +42,13 @@ export interface ToolEventInput {
 }
 
 export function createTranscriptState(): TranscriptState {
-    return { items: [], liveTools: [], liveToolsExpanded: false, committedToolRefs: new Set() };
+    return { items: [], liveTools: [], liveToolsExpanded: false, committedToolRefs: new Set(), committedFallbackKeys: new Set() };
 }
 
 export function appendUserItem(state: TranscriptState, displayText: string, submitText: string): void {
+    // New user turn — stepRef-less fallback keys are turn-scoped (the same
+    // tool label must commit fresh rows in later turns).
+    state.committedFallbackKeys.clear();
     state.items.push({ type: 'user', displayText, submitText, timestamp: Date.now() });
 }
 
@@ -58,9 +67,27 @@ export function appendToActiveAssistant(state: TranscriptState, chunk: string): 
 
 export function appendAssistantTurnText(state: TranscriptState, chunk: string, agentId?: string): boolean {
     if (!chunk) return false;
+    settleThinkingForAnswer(state, agentId);
     if (appendToActiveAssistant(state, chunk)) return true;
     startAssistantItem(state, agentId);
     return appendToActiveAssistant(state, chunk);
+}
+
+// jawcode parity (083.5): a live thinking tail settles into its collapsed
+// summary the moment the stream moves past it — i.e. when answer text starts.
+// stepRef-driven thinking rows have their own tool-event lifecycle and are
+// finalized by commitThinkingItemOnce instead.
+export function settleThinkingForAnswer(state: TranscriptState, agentId?: string): boolean {
+    let changed = false;
+    for (let i = state.items.length - 1; i >= 0; i--) {
+        const item = state.items[i]!;
+        if (item.type === 'user') break;
+        if (item.type !== 'thinking' || !item.streaming || item.stepRef) continue;
+        if (agentId && item.agentId && item.agentId !== agentId) continue;
+        item.streaming = false;
+        changed = true;
+    }
+    return changed;
 }
 
 function canAppendToThinking(item: TranscriptItem | undefined, agentId?: string): item is Extract<TranscriptItem, { type: 'thinking' }> {
@@ -163,7 +190,19 @@ export function assistantTextSinceLastUser(state: TranscriptState): string {
     return chunks.join('');
 }
 
+// jawcode parity (083.1/083.3 segment split): a tool event interrupts the
+// answer segment — the streaming assistant tail settles (loses its cursor)
+// and any answer text after the tools starts a new assistant item.
+export function settleAssistantForTool(state: TranscriptState, agentId?: string): boolean {
+    const last = state.items[state.items.length - 1];
+    if (!last || last.type !== 'assistant' || !last.streaming) return false;
+    if (agentId && last.agentId && last.agentId !== agentId) return false;
+    last.streaming = false;
+    return true;
+}
+
 export function appendToolItem(state: TranscriptState, text: string, opts?: { agentId?: string; detail?: string; stepRef?: string; status?: 'running' | 'done' | 'error' }): void {
+    settleAssistantForTool(state, opts?.agentId);
     if (opts?.stepRef) {
         const existing = state.items.find((item) => item.type === 'tool' && item.stepRef === opts.stepRef);
         if (existing?.type === 'tool') {
@@ -227,6 +266,7 @@ export function commitThinkingItemOnce(state: TranscriptState, input: ToolEventI
 }
 
 export function upsertLiveToolItem(state: TranscriptState, input: ToolEventInput): LiveToolItem {
+    settleAssistantForTool(state, input.agentId);
     const key = makeToolEventKey(input);
     const now = Date.now();
     const existing = state.liveTools.find(item => item.key === key);
@@ -259,6 +299,26 @@ export function commitToolItemOnce(state: TranscriptState, input: ToolEventInput
     const liveIndex = state.liveTools.findIndex(item => item.key === key);
     const live = liveIndex >= 0 ? state.liveTools[liveIndex] : null;
     if (liveIndex >= 0) state.liveTools.splice(liveIndex, 1);
+    if (!input.stepRef && state.committedFallbackKeys.has(key)) {
+        // Already committed this turn (agent-done toolLog replay): update the
+        // last matching stepRef-less row in place — mirroring the stepRef
+        // update path and the live-lane upsert that merges the same key.
+        if (commitOpts?.updateCommitted) {
+            for (let i = state.items.length - 1; i >= 0; i--) {
+                const item = state.items[i]!;
+                if (item.type !== 'tool' || item.stepRef || item.text !== input.label) continue;
+                if ((item.agentId ?? 'main') !== (input.agentId ?? 'main')) continue;
+                if (input.detail) item.detail = input.detail;
+                if (input.status) {
+                    item.status = input.status;
+                    item.collapsed = input.status !== 'running';
+                }
+                item.timestamp = Date.now();
+                break;
+            }
+        }
+        return false;
+    }
     if (input.stepRef && state.committedToolRefs.has(input.stepRef)) {
         if (commitOpts?.updateCommitted && input.detail) {
             appendToolItem(state, input.label, {
@@ -271,6 +331,7 @@ export function commitToolItemOnce(state: TranscriptState, input: ToolEventInput
         return false;
     }
     if (input.stepRef) state.committedToolRefs.add(input.stepRef);
+    else state.committedFallbackKeys.add(key);
 
     const detail = input.detail || live?.detail || '';
     const opts: Parameters<typeof appendToolItem>[2] = { detail, status: input.status };
@@ -278,6 +339,15 @@ export function commitToolItemOnce(state: TranscriptState, input: ToolEventInput
     if (input.stepRef) opts.stepRef = input.stepRef;
     appendToolItem(state, input.label, opts);
     return true;
+}
+
+/** 260703 CJ-WP3 — end-of-run reset: stepRef-less fallback dedup is scoped to
+ *  ONE agent run. Cleared here (agent-done, after the toolLog replay) rather
+ *  than only at user submits: /retry and external-message turns start runs
+ *  WITHOUT a user item, and a stale key would suppress their fresh tool rows
+ *  (B-verify High finding). */
+export function resetTurnToolDedup(state: TranscriptState): void {
+    state.committedFallbackKeys.clear();
 }
 
 export function commitRemainingLiveToolItems(state: TranscriptState, status: ToolEventInput['status'] = 'done'): number {
@@ -319,8 +389,14 @@ export function collapsePreviousTools(state: TranscriptState): void {
     }
 }
 
-export function toggleToolExpansion(state: TranscriptState): boolean {
-    const expandableItems = state.items.filter(i => i.type === 'tool' || i.type === 'thinking');
+// fromIndex: items before it are committed to native scrollback — their
+// pixels are frozen, so toggling them would only desync the live cell
+// heights from what the terminal actually shows (jawcode parity: committed
+// components are ineligible for the live expansion toggle).
+export function toggleToolExpansion(state: TranscriptState, fromIndex = 0): boolean {
+    const expandableItems = state.items
+        .slice(Math.max(0, fromIndex))
+        .filter(i => i.type === 'tool' || i.type === 'thinking');
     const hasLiveTools = state.liveTools.length > 0;
     if (expandableItems.length === 0 && !hasLiveTools) return false;
     const shouldExpand = expandableItems.some(i => i.collapsed !== false) || (hasLiveTools && !state.liveToolsExpanded);

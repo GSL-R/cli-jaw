@@ -67,7 +67,9 @@ test('SF-002: exit handler saves interrupted content to DB via insertMessageWith
 
     const cliCloseIdx = spawnSrc.indexOf("child.on('close'");
     assert.ok(cliCloseIdx > 0);
-    const cliBlock = spawnSrc.slice(cliCloseIdx, cliCloseIdx + 10000);
+    // The CLI close handler has grown past 10k chars (agy/kiro buffer flushes);
+    // keep a bounded window so the delegation still has to live in this handler.
+    const cliBlock = spawnSrc.slice(cliCloseIdx, cliCloseIdx + 20000);
     assert.ok(cliBlock.includes('handleAgentExit'), 'CLI close should delegate to handleAgentExit');
 });
 
@@ -109,7 +111,9 @@ test('SF-004: buildHistoryBlock filters stale worklog continue artifacts', () =>
     const src = fs.readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     const fnIdx = src.indexOf('function buildHistoryBlock');
     assert.ok(fnIdx > 0, 'buildHistoryBlock function should exist');
-    const fnBlock = src.slice(fnIdx, src.indexOf('function withHistoryPrompt'));
+    const fnEnd = src.indexOf('function isStaleWorklogHistoryArtifact', fnIdx);
+    assert.ok(fnEnd > fnIdx, 'buildHistoryBlock should end before stale artifact helper');
+    const fnBlock = src.slice(fnIdx, fnEnd);
 
     assert.ok(src.includes('function isStaleWorklogHistoryArtifact'), 'stale artifact helper should exist');
     assert.ok(fnBlock.includes('!isStaleWorklogHistoryArtifact(summary)'), 'compact marker summaries must be filtered');
@@ -141,7 +145,7 @@ test('SF-004b: resume argv CLIs keep enriched promptForArgs for agy and compact 
     );
 });
 
-test('SF-004c: agy delegates configurable prompt ordering to the bootstrap envelope', () => {
+test('SF-004c: agy passes configured prompt order to the bootstrap envelope', () => {
     const src = fs.readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     const agyBranchIdx = src.indexOf("if (cli === 'agy') {");
     const preflightIdx = src.indexOf('// ─── DIFF-A: Preflight', agyBranchIdx);
@@ -152,7 +156,7 @@ test('SF-004c: agy delegates configurable prompt ordering to the bootstrap envel
     assert.ok(agyBranch.includes('buildAgyBootstrapEnvelope({'), 'agy branch should use the bootstrap envelope builder');
     assert.ok(agyBranch.includes('taskPrompt: prompt'), 'agy bootstrap should receive the current task prompt');
     assert.ok(agyBranch.includes('operationalContext: sysPrompt'), 'agy bootstrap should receive operational context separately');
-    assert.ok(agyBranch.includes('order: resolveAgyPromptOrder(cfg.promptOrder)'), 'agy bootstrap should use configured prompt ordering');
+    assert.ok(agyBranch.includes('order: resolveAgyPromptOrder(cfg.promptOrder)'), 'agy bootstrap should receive the configured prompt order');
     assert.ok(agyBranch.includes('promptForArgs = agyBootstrap.prompt'), 'agy args prompt should be the ordered bootstrap prompt');
 });
 

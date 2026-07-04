@@ -5,7 +5,7 @@
 ### あなた専用の AI エージェント。2 行でインストール。11 個の AI ランタイムをひとつのダッシュボードに。
 
 [![npm](https://img.shields.io/npm/v/cli-jaw)](https://npmjs.com/package/cli-jaw)
-[![Version](https://img.shields.io/badge/v2.2.2-GA-brightgreen)](https://github.com/lidge-jun/cli-jaw/releases)
+[![Version](https://img.shields.io/badge/v2.2.3-GA-brightgreen)](https://github.com/lidge-jun/cli-jaw/releases)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://typescriptlang.org)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-blue)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
@@ -119,7 +119,6 @@ opencode             # OpenCode — 無料モデルあり
 claude auth login    # Anthropic Claude Pro 以上
 codex login          # OpenAI ChatGPT Pro 以上
 cursor-agent login   # Cursor
-gemini               # Google Gemini Advanced
 grok login --oauth   # xAI Grok / Grok Heavy
 kiro                 # AWS Kiro (free tier with AWS account)
 ```
@@ -136,7 +135,6 @@ kiro                 # AWS Kiro (free tier with AWS account)
  ✅ Claude CLI      installed
  ✅ Codex CLI       installed
  ✅ Cursor CLI      installed
- ⚠️ Gemini CLI      not found (optional)
  ✅ OpenCode CLI    installed
  ✅ Copilot CLI     installed
  ✅ Database        jaw.db OK
@@ -256,7 +254,6 @@ Employee は「Frontend は CSS、Backend は API」用。サブエージェン�
 | **Codex** | `gpt-5.5` | `codex login` | ChatGPT Pro サブスクリプション以上 |
 | **Codex App** | `gpt-5.5` | `codex login` | ChatGPT Pro サブスクリプション以上 |
 | **Cursor** | `composer-2.5` | `cursor-agent login` または `CURSOR_API_KEY` | Cursor サブスクリプション。quota は auth/status-only |
-| **Gemini** | `gemini-3-flash-preview` | `gemini` | Gemini Advanced サブスクリプション |
 | **Grok** | `grok-build` | `grok login --oauth` | Grok サブスクリプション；クォータは認証/ステータスのみ |
 | **Kiro** | registry-selected | `kiro` | AWS Kiro 無料枠；`kiro-cli chat --no-interactive` runtime |
 | **OpenCode** | `opencode-go/kimi-k2.6` | `opencode` | 無料モデルあり |

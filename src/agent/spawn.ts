@@ -43,6 +43,7 @@ import {
     setSpawnRef as setMemorySpawnRef,
 } from './memory-flush-controller.js';
 import { applyCliEnvDefaults, buildSessionResumeKey, ensureOpencodeAlwaysAllowPermissions } from './spawn-env.js';
+import { buildPromptForArgs, withHistoryPrompt } from './prompt-context.js';
 import { attachWatchdog, DEFAULT_WATCHDOG_ABSOLUTE_HARD_CAP_MS } from './watchdog.js';
 import {
     buildOpencodeRuntimeSnapshot,
@@ -59,27 +60,36 @@ import { appendTraceEvent, stampTraceTool, startTraceRun } from '../trace/store.
 import {
     AGY_COMPLETE_KILL_REASON,
     AGY_TOOL_TRACE_FAILURE_MESSAGE,
+    appendAgyFullText,
+    classifyAgyTranscriptMode,
+    describeAgyFinalSource,
     extractAgyConversationId,
+    finalizeAgyFallbackText,
+    formatAgyWatchdogContext,
     resolveAgyEmptyCloseError,
     formatAgyTimeoutMessage,
     getAgyQuietCompletionDelayMs,
     isAgyInternalToolTraceOutput,
     isAgyStaleSessionOutput,
     normalizeAgyCloseText,
+    shouldFreezeAgyLiveDisplay,
     stripAgyPromptEchoPrefix,
     stripAgyResumeReplayPrefix,
     stripAgyResumeReplayPrefixes,
 } from './agy-runtime.js';
 import { detectAgyCapabilities } from './agy-capabilities.js';
-import { buildAgyBootstrapEnvelope, type AgyBootstrapEnvelope } from './agy-bootstrap.js';
+import {
+    buildAgyBootstrapEnvelope,
+    resolveAgyPromptOrder,
+    type AgyBootstrapEnvelope,
+} from './agy-bootstrap.js';
 import { startAgyTranscriptWatcher, type AgyTranscriptWatcherHandle } from './agy-transcript-watcher.js';
 import {
     buildAgySpillArgPrompt,
     buildAgySpillWorkspaceFiles,
-    resolveAgyPromptOrder,
     serializeAgyCompactRoutes,
 } from './agy-prompt.js';
-import { appendAssistantTextSegment, normalizeAssistantDisplayText, pushTrace } from './events/helpers.js';
+import { appendAssistantTextSegment, emitAgentTool, normalizeAssistantDisplayText, pushTrace } from './events/helpers.js';
 import { listKiroConversationIdsForCwd } from './kiro-auth.js';
 import {
     captureKiroSessionIdAfterExit,
@@ -340,7 +350,7 @@ function emitKiroStreamEvents(
         }
         if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
         appendParentLiveRunTool(ctx, tool);
-        broadcast('agent_tool', { agentId: agentLabel, ...tool, ...empTag }, traceAudience);
+        emitAgentTool(ctx, agentLabel, tool, empTag);
     }
 }
 
@@ -630,7 +640,6 @@ export async function steerAgent(newPrompt: string, source: string) {
 function makeCleanEnv(extraEnv: Record<string, string> = {}) {
     const env: NodeJS.ProcessEnv = { ...process.env };
     delete env["CLAUDE_CODE_SSE_PORT"];
-    delete env["GEMINI_SYSTEM_MD"];
     // Phase 8: strip boss-only dispatch token from employee spawns so employees
     // cannot authenticate against /api/orchestrate/dispatch even via localhost.
     // Detect employee spawn by the explicit JAW_EMPLOYEE_MODE flag; main spawns
@@ -720,18 +729,6 @@ function isStaleWorklogHistoryArtifact(text: string): boolean {
     ].some(marker => value.includes(marker));
 }
 
-const HISTORY_BOUNDARY_INSTRUCTION = [
-    '[History Boundary]',
-    'Recent Context is read-only background. The Current Message below is the only task to execute now.',
-    'Do not continue prior plans, audits, commands, questions, or goals unless the Current Message explicitly asks to resume or continue them.',
-].join('\n');
-
-function withHistoryPrompt(prompt: string, historyBlock: string) {
-    const body = String(prompt || '');
-    if (!historyBlock) return body;
-    return `${historyBlock}\n\n${HISTORY_BOUNDARY_INSTRUCTION}\n\n---\n[Current Message]\n${body}`;
-}
-
 function getLatestAssistantContentForAgyResume(workingDir?: string | null): string | null {
     const rows = getRecentMessages.all(workingDir || null, getActiveChatSession(), 12) as RecentMessageRow[];
     const row = rows.find((msg) => msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.trim().length > 0);
@@ -762,13 +759,11 @@ import { AcpClient } from '../cli/acp-client.js';
 import { CodexAppClient } from './codex-app-client.js';
 import { extractFromCodexAppEvent } from './codex-app-events.js';
 
-import { shouldEmitHeartbeat, shouldEnableAgyNativeResume, shouldResumeBucketSession, GEMINI_RESUME_TTL_MS } from './spawn/resume.js';
-export { shouldEmitHeartbeat, shouldResumeBucketSession, GEMINI_RESUME_TTL_MS };
+import { shouldEmitHeartbeat, shouldEnableAgyNativeResume, shouldResumeBucketSession } from './spawn/resume.js';
+export { shouldEmitHeartbeat, shouldResumeBucketSession };
 import { createQueueController, FALLBACK_MAX_RETRIES } from './spawn/queue.js';
 export type { QueueController } from './spawn/queue.js';
 
-const GEMINI_HISTORY_MAX_SESSIONS = 4;
-const GEMINI_HISTORY_MAX_CHARS = 8000;
 
 export interface SpawnLifecycle {
     onActivity?: (source: string) => void;
@@ -1145,9 +1140,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         } catch (e) {
             console.warn('[jaw:resume] stale bucket clear failed:', (e as Error).message);
         }
-        if (cli === 'gemini') {
-            console.log(`[jaw:resume] ${cli} stale bucket rejected for model ${bucketModel ?? 'none'} → ${model}; starting fresh session`);
-        } else if (cli === 'opencode' && resumeKey !== (bucketResumeKey ?? null)) {
+        if (cli === 'opencode' && resumeKey !== (bucketResumeKey ?? null)) {
             console.log(`[jaw:resume] ${cli} resume key changed ${bucketResumeKey ?? 'none'} → ${resumeKey}; starting fresh session`);
         } else {
             console.log(`[jaw:resume] ${cli} model changed ${bucketModel} → ${runtimeModel}; starting fresh session`);
@@ -1207,17 +1200,19 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ? buildHistoryBlock(
             prompt,
             settings["workingDir"],
-            cli === 'gemini' ? GEMINI_HISTORY_MAX_SESSIONS : 10,
-            cli === 'gemini' ? GEMINI_HISTORY_MAX_CHARS : 8000,
+            10,
+            8000,
         )
         : '';
     let agyBootstrap: AgyBootstrapEnvelope | null = null;
-    let promptForArgs = (cli === 'cursor' || cli === 'kiro-code' || cli === 'gemini' || cli === 'grok' || cli === 'opencode' || (cli === 'ai-e' && effectiveProvider !== 'claude'))
-        ? withHistoryPrompt(prompt, historyBlock)
-        : prompt;
-    if ((cli === 'kiro-code' || (cli === 'ai-e' && effectiveProvider === 'kiro')) && sysPrompt) {
-        promptForArgs = `[Operational Context — cli-jaw Integration]\nThe following operational guidelines apply to this session. Follow these task rules and use the tools/commands described:\n\n${sysPrompt}\n\n---\n\n${promptForArgs}`;
-    }
+    let promptForArgs = buildPromptForArgs({
+        cli,
+        effectiveProvider,
+        prompt,
+        historyBlock,
+        sysPrompt,
+        isResume,
+    });
     const agyResumeReplayPrefix = cli === 'agy' && isResume
         ? getLatestAssistantContentForAgyResume(settings["workingDir"])
         : null;
@@ -1349,11 +1344,6 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         if (cli === 'claude-e') console.log(`[jaw:${agentLabel}:args] ${JSON.stringify(args)}`);
     }
 
-    if (cli === 'gemini' && sysPrompt) {
-        const tmpSysFile = join(os.tmpdir(), `jaw-gemini-sys-${agentLabel}.md`);
-        fs.writeFileSync(tmpSysFile, sysPrompt);
-        spawnEnv["GEMINI_SYSTEM_MD"] = tmpSysFile;
-    }
 
     // ─── Copilot ACP branch ──────────────────────
     if (cli === 'copilot') {
@@ -1421,6 +1411,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             hasClaudeStreamEvents: false, sessionId: null as string | null, cost: null as number | null,
             turns: null as number | null, duration: null as number | null, tokens: null, stderrBuf: '',
             thinkingBuf: '',
+            runStartedAt: Date.now(),
             liveScope: effectiveLiveScope,
             parentLiveScope: parentLiveScopeForChild,
             traceRunId,
@@ -1440,7 +1431,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 ctx.toolLog.push(tool);
                 if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                 appendParentLiveRunTool(ctx, tool);
-                broadcast('agent_tool', { agentId: agentLabel, ...tool, ...empTag }, traceAudience);
+                emitAgentTool(ctx, agentLabel, tool, empTag);
             }
             ctx.thinkingBuf = '';
         }
@@ -1474,7 +1465,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                     ctx.toolLog.push(parsedTool);
                     if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                     appendParentLiveRunTool(ctx, parsedTool);
-                    broadcast('agent_tool', { agentId: agentLabel, ...parsedTool, ...empTag }, traceAudience);
+                    emitAgentTool(ctx, agentLabel, parsedTool, empTag);
                     // Reset heartbeat gate on actually visible broadcast (not 💭)
                     lastVisibleBroadcastTs = Date.now();
                     heartbeatSent = false;
@@ -1503,7 +1494,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 ctx.toolLog.push(parsed.tool);
                 if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                 appendParentLiveRunTool(ctx, parsed.tool);
-                broadcast('agent_tool', { agentId: agentLabel, ...parsed.tool, ...empTag }, traceAudience);
+                emitAgentTool(ctx, agentLabel, parsed.tool, empTag);
             }
         });
 
@@ -1518,7 +1509,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 ctx.toolLog.push(parsed.tool);
                 if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                 appendParentLiveRunTool(ctx, parsed.tool);
-                broadcast('agent_tool', { agentId: agentLabel, ...parsed.tool, ...empTag }, traceAudience);
+                emitAgentTool(ctx, agentLabel, parsed.tool, empTag);
             }
         });
 
@@ -1535,12 +1526,10 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 heartbeatSent = true;
                 const elapsed = Math.round((Date.now() - lastVisibleBroadcastTs) / 1000);
                 console.log(`  ⏳ agent active (no visible event for ${elapsed}s)`);
-                broadcast('agent_tool', {
-                    agentId: agentLabel,
+                emitAgentTool(ctx, agentLabel, {
                     icon: '⏳',
                     label: 'working... (no visible progress)',
-                    ...empTag,
-                }, traceAudience);
+                }, empTag);
             }
         });
 
@@ -1680,6 +1669,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             toolLog: [],
             seenToolKeys: new Set<string>(),
             hasClaudeStreamEvents: false,
+            runStartedAt: Date.now(),
             sessionId: null,
             cost: null,
             turns: null,
@@ -1708,7 +1698,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 ctx.toolLog.push(tool);
                 if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                 appendParentLiveRunTool(ctx, tool);
-                broadcast('agent_tool', { agentId: agentLabel, ...tool, ...empTag }, traceAudience);
+                emitAgentTool(ctx, agentLabel, tool, empTag);
             }
             ctx.thinkingBuf = '';
         }
@@ -1749,7 +1739,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                     ctx.toolLog.push(tool);
                     if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                     appendParentLiveRunTool(ctx, tool);
-                    broadcast('agent_tool', { agentId: agentLabel, ...tool, ...empTag }, traceAudience);
+                    emitAgentTool(ctx, agentLabel, tool, empTag);
                     return;
                 }
                 if (event.kind === 'session') {
@@ -1886,6 +1876,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             hasClaudeStreamEvents: false, sessionId: null as string | null, cost: null as number | null,
             turns: null as number | null, duration: null as number | null, tokens: null, stderrBuf: '',
             thinkingBuf: '',
+            runStartedAt: Date.now(),
             liveScope: effectiveLiveScope,
             parentLiveScope: parentLiveScopeForChild,
             traceRunId,
@@ -1904,7 +1895,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 ctx.toolLog.push(tool);
                 if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                 appendParentLiveRunTool(ctx, tool);
-                broadcast('agent_tool', { agentId: agentLabel, ...tool, ...empTag }, traceAudience);
+                emitAgentTool(ctx, agentLabel, tool, empTag);
             }
             ctx.thinkingBuf = '';
         }
@@ -1937,7 +1928,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                     ctx.toolLog.push(parsedTool);
                     if (ctx.liveScope) replaceLiveRunTools(ctx.liveScope, ctx.toolLog);
                     appendParentLiveRunTool(ctx, parsedTool);
-                    broadcast('agent_tool', { agentId: agentLabel, ...parsedTool, ...empTag }, traceAudience);
+                    emitAgentTool(ctx, agentLabel, parsedTool, empTag);
                     lastVisibleBroadcastTs = Date.now();
                     heartbeatSent = false;
                 }
@@ -1974,12 +1965,10 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 heartbeatSent = true;
                 const elapsed = Math.round((Date.now() - lastVisibleBroadcastTs) / 1000);
                 console.log(`  ⏳ agent active (no visible event for ${elapsed}s)`);
-                broadcast('agent_tool', {
-                    agentId: agentLabel,
+                emitAgentTool(ctx, agentLabel, {
                     icon: '⏳',
                     label: 'working... (no visible progress)',
-                    ...empTag,
-                }, traceAudience);
+                }, empTag);
             }
         });
 
@@ -2112,7 +2101,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         return { child, promise: resultPromise };
     }
 
-    // ─── Standard CLI branch (claude/codex/gemini/opencode) ──────
+    // ─── Standard CLI branch (claude/codex/opencode) ──────
     // DIFF-B: Windows needs shell:true only when falling back to .cmd shims.
     const spawnCommand = cli === 'opencode' && process.platform !== 'win32'
         ? (resolvedOpencodeBinary || detected.path || cli)
@@ -2209,6 +2198,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         toolLog: [],
         seenToolKeys: new Set<string>(),
         hasClaudeStreamEvents: false,
+        runStartedAt: Date.now(),
         sessionId: (kiroPlainText && isResume && resumeSessionId) ? resumeSessionId : null,
         cost: null as number | null,
         turns: null as number | null,
@@ -2223,13 +2213,15 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         parentLiveScope: parentLiveScopeForChild,
         traceRunId,
         traceAudience,
-        geminiResultSeen: false,
         ...(opencodeSpawnAudit ? { opencodeSpawnAudit: opencodeSpawnAudit as Record<string, unknown> } : {}),
         ...(agyResumeOffset > 0 ? { agyResumeOffset, agyBytesReceived: 0 } : {}),
         ...(cli === 'agy' ? {
+            agyTranscriptMode: 'not-started' as const,
+            agyLastActivitySource: 'none' as const,
             ...(agyBootstrap ? {
                 agyBootstrapSentinel: agyBootstrap.sentinel,
                 agyBootstrapHash: agyBootstrap.hash,
+                metadata: { agyPromptSpill: agyBootstrap.spill },
             } : {}),
             agyBootstrapAccepted: false,
             agyBootstrapAcceptanceMode: agyBootstrap ? 'pending' as const : 'not-applicable' as const,
@@ -2237,7 +2229,6 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         ...(kiroPlainText || cli === 'agy' || cli === 'pi' ? { liveOutputText: '' } : {}),
         ...(kiroPlainText ? { kiroLastVisibleAt: Date.now(), kiroHeartbeatSent: false } : {}),
     };
-    let geminiWatchdog: ReturnType<typeof setTimeout> | null = null;
     let agyClosing = false;
     const scheduleAgyQuietCompletion = () => {
         if (cli !== 'agy') return;
@@ -2289,6 +2280,12 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         console.log(`[jaw:watchdog] killing ${agentLabel} — ${reason}`);
         ctx.stallReason = reason;
         recordMainInterruption(reason);
+        if (cli === 'agy') {
+            ctx.agyTranscriptMode = classifyAgyTranscriptMode(ctx);
+            const agyWatchdogContext = formatAgyWatchdogContext(ctx);
+            ctx.stderrBuf = ctx.stderrBuf ? `${ctx.stderrBuf}\n${agyWatchdogContext}` : agyWatchdogContext;
+            pushTrace(ctx, agyWatchdogContext);
+        }
         if (child.pid) {
             killReasons.set(child.pid, reason);
             killProcessTree(child.pid, 'SIGTERM');
@@ -2310,11 +2307,11 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             cli,
             empTag,
             traceAudience,
-            onEmit: (emitCtx, tool, label, _cliName, tag, audience) => {
+            onEmit: (emitCtx, tool, label, _cliName, tag, _audience) => {
                 stampTraceTool(tool, emitCtx, tool.toolType || 'tool');
                 if (emitCtx.liveScope) replaceLiveRunTools(emitCtx.liveScope, emitCtx.toolLog);
                 appendParentLiveRunTool(emitCtx, tool);
-                broadcast('agent_tool', { agentId: label, ...tool, ...tag }, audience);
+                emitAgentTool(emitCtx, label, tool, tag);
                 scheduleAgyQuietCompletion();
             },
             onActivity: () => {
@@ -2373,6 +2370,9 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             eventType: fieldString(asCliEventRecord(raw).type, '<no-type>'),
             raw,
         });
+        if (cli === 'grok' || (cli === 'ai-e' && ctx.effectiveProvider === 'grok')) {
+            ctx.stallWatchdog?.markProgress();
+        }
         // claude-e / ai-e Claude: intercept jaw_runtime events BEFORE discriminator
         if ((cli === 'claude-e' || cli === 'ai-e') && isJawRuntimeEvent(raw)) {
             const rtEvt = raw as Record<string, unknown>;
@@ -2406,13 +2406,6 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         logEventSummary(agentLabel, dispatchCli, event, ctx);
         if (!ctx.sessionId) ctx.sessionId = extractSessionId(dispatchCli, event);
         extractFromEvent(dispatchCli, event, ctx, agentLabel, empTag);
-        // Gemini watchdog: AFTER extractFromEvent sets geminiResultSeen
-        if (dispatchCli === 'gemini' && ctx.geminiResultSeen && !geminiWatchdog) {
-            geminiWatchdog = setTimeout(() => {
-                console.warn(`[jaw:gemini-watchdog] ${agentLabel} — result seen but close not received after 10s, killing`);
-                try { child.kill('SIGTERM'); } catch { /* already dead */ }
-            }, 10000);
-        }
         // Sub-agent wait: keep stall timer alive
         if (ctx.hasActiveSubAgent) {
             opts.lifecycle?.onActivity?.('heartbeat');
@@ -2440,12 +2433,13 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         opts.lifecycle?.onActivity?.('stdout');
         lastOpencodeIoAt = Date.now();
         if (cli === 'agy') {
+            ctx.agyLastActivitySource = 'stdout';
             const rawText = agyUtf8!.write(chunk);
             if (!rawText) return;
+            ctx.stallWatchdog?.markProgress();
             // Defensive ANSI strip (belt-and-suspenders with NO_COLOR=1)
             const text = rawText.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-            if (ctx.fullText.length < 102_400) ctx.fullText += text;
-            else if (ctx.fullText.length < 102_500) ctx.fullText += text.slice(0, 102_400 - ctx.fullText.length);
+            appendAgyFullText(ctx, text);
             if (!ctx.sessionId) ctx.sessionId = extractAgyConversationId(ctx.fullText);
             if (ctx.agyResumeOffset && ctx.agyResumeOffset > 0) {
                 ctx.agyBytesReceived = (ctx.agyBytesReceived ?? 0) + text.length;
@@ -2458,6 +2452,12 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
                 ctx.outputTextStarted = true;
                 appendTraceEvent({ runId: ctx.traceRunId, source: 'cli_raw', eventType: 'plain_text', raw: newText });
                 broadcastAgentOutput(ctx, agentLabel, cli, newText, empTag, traceAudience);
+                scheduleAgyQuietCompletion();
+                return;
+            }
+            if (shouldFreezeAgyLiveDisplay(ctx)) {
+                // Display frozen past AGY_LIVE_DISPLAY_MAX_CHARS; the close path
+                // promotes the full text into the live candidate (finalizeAgyFallbackText).
                 scheduleAgyQuietCompletion();
                 return;
             }
@@ -2485,6 +2485,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         if (kiroPlainText) {
             const text = kiroUtf8!.write(chunk);
             if (!text) return;
+            ctx.stallWatchdog?.markProgress();
             appendTraceEvent({ runId: ctx.traceRunId, source: 'cli_raw', eventType: 'plain_text', raw: text });
             const events = processKiroStdoutChunk(ctx, text);
             if (events.length) {
@@ -2506,6 +2507,8 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         clearAgyQuietCompletionTimer();
         lastOpencodeIoAt = Date.now();
         const text = chunk.toString().trim();
+        if (cli === 'agy') ctx.agyLastActivitySource = 'stderr';
+        if ((kiroPlainText || cli === 'agy') && text) ctx.stallWatchdog?.markProgress();
         appendTraceEvent({ runId: ctx.traceRunId, source: 'stderr', eventType: 'stderr', raw: text });
         console.error(`[jaw:stderr:${agentLabel}] ${text}`);
         if (ctx.stderrBuf.length < 4000) ctx.stderrBuf += text + '\n';
@@ -2516,7 +2519,6 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         clearOpencodeIdleTimer();
         clearAgyQuietCompletionTimer();
         stallWatchdog.stop();
-        if (geminiWatchdog) { clearTimeout(geminiWatchdog); geminiWatchdog = null; }
         if (stdSettled) return;  // error handler already resolved
         // [I1] Flush residual NDJSON buffer — last event may lack trailing newline
         if (buffer.trim()) {
@@ -2527,7 +2529,7 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         if (cli === 'opencode') flushOpenCodeBuffers(ctx, agentLabel, empTag);
         if (agyUtf8) {
             const remaining = agyUtf8.end();
-            if (remaining) ctx.fullText += remaining;
+            if (remaining) appendAgyFullText(ctx, remaining);
         }
         if (kiroUtf8) {
             const remaining = kiroUtf8.end();
@@ -2564,6 +2566,9 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         }
         agyClosing = true;
         agyTranscriptWatcher?.stop();
+        if (cli === 'agy') {
+            ctx.agyTranscriptMode = classifyAgyTranscriptMode(ctx);
+        }
         if (cli === 'agy' && isResume && isAgyStaleSessionOutput(ctx.fullText)) {
             console.log(`[jaw:agy] stale session detected (Warning: conversation not found) — clearing bucket`);
             try {
@@ -2671,6 +2676,19 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
         const agyTranscriptErrorMessage = cli === 'agy' && !agyTimedOut
             ? resolveAgyEmptyCloseError(ctx)
             : null;
+        if (cli === 'agy' && !agyTimedOut && !agyTranscriptErrorMessage) {
+            // Mirror the per-chunk display derivation ORDER (replay → echo → tracker →
+            // normalize). The close-path strips above run echo-before-replay and can
+            // leave a prompt echo in resumed output; every strip is a prefix-stripper
+            // that no-ops when the prefix is already gone, so re-running them in
+            // per-chunk order is idempotent and safe.
+            const promotedBase = isResume
+                ? stripAgyResumeReplayPrefixes(ctx.fullText, agyResumeReplayPrefixes).text
+                : ctx.fullText;
+            const promotedEcho = stripAgyPromptEchoPrefix(promotedBase, promptForArgs).text;
+            finalizeAgyFallbackText(ctx, normalizeAssistantDisplayText(stripInterviewTracker(promotedEcho)));
+        }
+        if (cli === 'agy') pushTrace(ctx, describeAgyFinalSource(ctx));
         const effectiveExitCode = agyCompletedByQuietOutput && !agyTranscriptErrorMessage
             ? 0
             : agyTranscriptErrorMessage

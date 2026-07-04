@@ -34,6 +34,10 @@ export interface ProcessBlockState {
      *  set by the "show N hidden steps" expander so a live long turn stays fully
      *  reachable (devlog 260620 Phase 4). Persists across new live steps. */
     expandedSteps?: boolean;
+    /** Authoritative run-start (server startedAt) for the elapsed timer — steps carry
+     *  client-arrival startTime, which resets to ~0 on live updates (WP3 zero-seconds
+     *  bug). When set, elapsed derives from this instead of steps[0].startTime. */
+    startedAt?: number;
     _durationEl?: HTMLElement | null;
 }
 let _tickerHandle: ReturnType<typeof setInterval> | null = null;
@@ -66,12 +70,44 @@ export interface StoredProcessStepMeta {
 const processDetailStore = new Map<string, { detail: string; originalLength: number; truncated: boolean }>();
 const processStepMetaStore = new Map<string, StoredProcessStepMeta>();
 
+// Phase 30 (virtual-scroll/process-block measurement): observe the memory-policy
+// hot paths without changing behavior. releaseProcessBlockDetails frees detail/meta
+// when a block is recycled/collapsed; reconstructStepsFromBlock rebuilds an elided
+// block from the persistent id list + meta store. These write-only counters make
+// long-session/huge-block activity observable (no behavior change).
+let releaseDetailsCalls = 0;
+let releaseDetailsIdsCleared = 0;
+let reconstructCalls = 0;
+let reconstructStepsBuilt = 0;
+
+export function getProcessBlockMetrics(): {
+    releaseDetailsCalls: number;
+    releaseDetailsIdsCleared: number;
+    reconstructCalls: number;
+    reconstructStepsBuilt: number;
+} {
+    return { releaseDetailsCalls, releaseDetailsIdsCleared, reconstructCalls, reconstructStepsBuilt };
+}
+
+export function resetProcessBlockMetrics(): void {
+    releaseDetailsCalls = 0;
+    releaseDetailsIdsCleared = 0;
+    reconstructCalls = 0;
+    reconstructStepsBuilt = 0;
+}
+
+function blockElapsedOrigin(pb: ProcessBlockState): number | null {
+    return pb.startedAt ?? pb.steps[0]?.startTime ?? null;
+}
+
 function tickDuration(): void {
     const pb = _tickerBlock;
     if (!pb || pb.collapsed || pb.steps.length === 0) { stopBlockTicker(); return; }
     const el = pb._durationEl ?? (pb._durationEl = pb.element.querySelector('.process-duration') as HTMLElement | null);
     if (!el) return;
-    const elapsed = Math.round((Date.now() - pb.steps[0].startTime) / 1000);
+    const origin = blockElapsedOrigin(pb);
+    if (origin === null) return;
+    const elapsed = Math.round((Date.now() - origin) / 1000);
     el.textContent = elapsed > 0 ? `${elapsed}s` : '';
 }
 function ensureTicker(pb: ProcessBlockState): void {
@@ -433,6 +469,14 @@ export function bindProcessBlockInteractions(root: HTMLElement): void {
                 summary.setAttribute('aria-expanded', expanding ? 'true' : 'false');
                 const chevron = summary.querySelector('.process-chevron');
                 if (chevron) chevron.innerHTML = expanding ? ICONS.chevronDown : ICONS.chevronRight;
+                // Keep the live state in sync with the DOM toggle so the elapsed
+                // ticker starts on expand / stops on collapse (WP3: it previously
+                // gated on a pb.collapsed that never changed).
+                const pb = blockStatesByElement.get(block as HTMLElement);
+                if (pb) {
+                    pb.collapsed = !expanding;
+                    updateSummary(pb);
+                }
             });
         }
     });
@@ -469,14 +513,22 @@ function updateSummary(pb: ProcessBlockState): void {
         dot.classList.toggle('done', !anyRunning || pb.collapsed);
     }
 
-    const elapsed = pb.steps.length > 0
-        ? Math.round((Date.now() - pb.steps[0].startTime) / 1000)
+    const elapsedOrigin = blockElapsedOrigin(pb);
+    const elapsed = elapsedOrigin !== null
+        ? Math.round((Date.now() - elapsedOrigin) / 1000)
         : 0;
     const dur = pb._durationEl ?? (pb._durationEl = pb.element.querySelector('.process-duration') as HTMLElement | null);
     if (dur) dur.textContent = elapsed > 0 ? `${elapsed}s` : '';
 
     if (anyRunning && !pb.collapsed) ensureTicker(pb);
     else if (_tickerBlock === pb) stopBlockTicker();
+}
+
+/** Register a block state reconstructed outside createProcessBlock (e.g. from DOM by
+ *  currentProcessBlockFromDom) so the delegated click handler can sync pb.collapsed
+ *  and drive the elapsed ticker for hydrated/restored live blocks (WP3). */
+export function registerProcessBlockState(state: ProcessBlockState): void {
+    blockStatesByElement.set(state.element, state);
 }
 
 export function createProcessBlock(parentEl: HTMLElement): ProcessBlockState {
@@ -575,6 +627,7 @@ export function collapseBlock(pb: ProcessBlockState): void {
 
 export function releaseProcessBlockDetails(rootOrState: HTMLElement | ProcessBlockState | null | undefined): void {
     if (!rootOrState) return;
+    releaseDetailsCalls++;
     const ids = new Set<string>();
     if ('steps' in rootOrState) {
         rootOrState.steps.forEach(step => ids.add(step.id));
@@ -598,6 +651,7 @@ export function releaseProcessBlockDetails(rootOrState: HTMLElement | ProcessBlo
         processDetailStore.delete(id);
         processStepMetaStore.delete(id);
     });
+    releaseDetailsIdsCleared += ids.size;
 }
 
 export function processStepMetaFromStore(stepId: string): StoredProcessStepMeta | null {
@@ -611,6 +665,7 @@ export function processStepMetaFromStore(stepId: string): StoredProcessStepMeta 
  *  meta store rather than scanning .process-step rows. Returns [] if the meta store
  *  was released (caller then no-ops, preserving prior behavior). */
 export function reconstructStepsFromBlock(block: HTMLElement): ProcessStep[] {
+    reconstructCalls++;
     const ids = (block.dataset['processStepIds'] || '').split(/\s+/).filter(Boolean);
     const steps: ProcessStep[] = [];
     for (const id of ids) {
@@ -637,5 +692,6 @@ export function reconstructStepsFromBlock(block: HTMLElement): ProcessStep[] {
             startTime: meta.startTime,
         });
     }
+    reconstructStepsBuilt += steps.length;
     return steps;
 }

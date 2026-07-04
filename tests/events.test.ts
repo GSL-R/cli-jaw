@@ -14,6 +14,7 @@ import {
     makeClaudeToolKeyForTest,
 } from '../src/agent/events.ts';
 import { parseGrokChatHistoryToolEntries } from '../src/agent/grok-trace-backfill.ts';
+import { startTraceRun, countToolTraceRows, listToolEntriesForRun } from '../src/trace/store.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -93,13 +94,12 @@ test('claude system compact events emit compacting and boundary labels', () => {
 test('extractSessionId handles all supported CLIs', () => {
     assert.equal(extractSessionId('claude', { type: 'system', session_id: 'claude-1' }), 'claude-1');
     assert.equal(extractSessionId('codex', { type: 'thread.started', thread_id: 'thread-1' }), 'thread-1');
-    assert.equal(extractSessionId('gemini', { type: 'init', session_id: 'gemini-1' }), 'gemini-1');
     assert.equal(extractSessionId('grok', { type: 'end', sessionId: 'grok-1' }), 'grok-1');
     assert.equal(extractSessionId('opencode', { sessionID: 'oc-1' }), 'oc-1');
     assert.equal(extractSessionId('unknown', { type: 'x' }), null);
 });
 
-test('tool label extraction fixture matrix covers codex, gemini, and opencode variants', () => {
+test('tool label extraction fixture matrix covers codex and opencode variants', () => {
     const fixtureCases = [
         {
             name: 'claude stream thinking (block_start — buffered, no immediate label)',
@@ -136,24 +136,6 @@ test('tool label extraction fixture matrix covers codex, gemini, and opencode va
             cli: 'codex',
             fixture: 'codex-reasoning.json',
             expected: [{ icon: '💭', label: 'Plan isolate regression', toolType: 'thinking', detail: 'Plan isolate regression' }],
-        },
-        {
-            name: 'gemini tool use',
-            cli: 'gemini',
-            fixture: 'gemini-tool-use.json',
-            expected: [{ icon: '🔧', label: 'shell: npm run lint', toolType: 'tool', detail: 'npm run lint', stepRef: 'gemini:toolid:run_shell_command_123' }],
-        },
-        {
-            name: 'gemini tool result success',
-            cli: 'gemini',
-            fixture: 'gemini-tool-result-success.json',
-            expected: [{ icon: '✅', label: 'success', toolType: 'tool', stepRef: 'gemini:toolid:run_shell_command_123', status: 'done' }],
-        },
-        {
-            name: 'gemini tool result error',
-            cli: 'gemini',
-            fixture: 'gemini-tool-result-error.json',
-            expected: [{ icon: '❌', label: 'error', toolType: 'tool', stepRef: 'gemini:toolid:run_shell_command_123', status: 'error' }],
         },
         {
             name: 'opencode tool use',
@@ -303,6 +285,100 @@ test('claude final assistant block is skipped after text_delta stream (no doubli
     assert.equal(ctx.claudeStreamedText, false, 'per-message flag reset for the next message');
 });
 
+test('claude message-boundary reconcile restores segment separators between tool-separated messages', () => {
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
+    const delta = (text) => extractFromEvent('claude', {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+    }, ctx, 'test');
+    const complete = (text) => extractFromEvent('claude', {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text }] },
+    }, ctx, 'test');
+
+    // Message 1: bullet item streamed in token-granular deltas, then canonical block.
+    delta('- ㅇ');
+    delta('ㅇ');
+    complete('- ㅇㅇ');
+    assert.equal(ctx.fullText, '- ㅇㅇ', 'single message reconcile is value-identical');
+
+    // (tool events happen here — they never touch fullText)
+
+    // Message 2: raw append alone would produce '- ㅇㅇ- ㅇㅇ' (the reported bug);
+    // the complete-block reconcile must restore the '\n' boundary like codex/claude-e.
+    delta('- ㅇㅇ');
+    complete('- ㅇㅇ');
+    assert.equal(ctx.fullText, '- ㅇㅇ\n- ㅇㅇ', 'boundary between messages restored');
+});
+
+test('claude plain-text messages get codex-parity segment bullets at the boundary', () => {
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
+    const delta = (text) => extractFromEvent('claude', {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+    }, ctx, 'test');
+    const complete = (text) => extractFromEvent('claude', {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text }] },
+    }, ctx, 'test');
+
+    delta('hello');
+    complete('hello');
+    assert.equal(ctx.fullText, 'hello', 'first plain message stays unbulleted');
+
+    delta('world');
+    complete('world');
+    // Matches the codex segment convention (first\n- second).
+    assert.equal(ctx.fullText, 'hello\n- world', 'later message gets the segment boundary');
+});
+
+test('claude within-message newlines survive reconcile (live-capture fixture)', () => {
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
+    // Real deltas captured from claude stream-json on 2026-07-03: ["-", " one\n- two\n- three"]
+    for (const text of ['-', ' one\n- two\n- three']) {
+        extractFromEvent('claude', {
+            type: 'stream_event',
+            event: { type: 'content_block_delta', delta: { type: 'text_delta', text } },
+        }, ctx, 'test');
+    }
+    extractFromEvent('claude', {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: '- one\n- two\n- three' }] },
+    }, ctx, 'test');
+    assert.equal(ctx.fullText, '- one\n- two\n- three', 'canonical newlines intact, no doubling');
+});
+
+test('claude streamed text is retained when the complete block never arrives', () => {
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
+    extractFromEvent('claude', {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial ans' } },
+    }, ctx, 'test');
+    // Interrupt/kill: no assistant event. Raw streamed text must survive.
+    assert.equal(ctx.fullText, 'partial ans');
+    assert.equal(ctx.claudeStreamedTextStart, 0, 'anchor recorded for the open message');
+});
+
+test('claude-e stream_event text_delta passthrough never raw-appends (snapshot path stays canonical)', () => {
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
+    // The claude-e wrapper passes stream_event lines through; the plain-claude raw
+    // appender must ignore them or the snapshot diff would double text.
+    extractFromEvent('claude-e', {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'stray delta' } },
+    }, ctx, 'test');
+    assert.equal(ctx.fullText, '', 'claude-e delta must not touch fullText');
+    assert.ok(!ctx.claudeStreamedText, 'claude-e delta must not arm the plain-claude guard');
+    assert.equal(ctx.claudeStreamedTextStart, undefined, 'no reconcile anchor for claude-e');
+
+    // The canonical snapshot then produces exactly one body.
+    extractFromEvent('claude-e', {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'canonical body' }] },
+    }, ctx, 'test');
+    assert.equal(ctx.fullText, 'canonical body', 'snapshot path unaffected, single body');
+});
+
 test('claude falls back to complete assistant block when no text_delta streamed', () => {
     const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
     // No partial stream events (e.g. --include-partial-messages absent): only the complete assistant.
@@ -364,19 +440,6 @@ test('extractFromEvent updates context for each CLI path', () => {
     assert.equal(codexCtx.fullText, 'done');
     assert.deepEqual(codexCtx.tokens, { input_tokens: 10, output_tokens: 20, cached_input_tokens: 0 });
 
-    const geminiCtx = { toolLog: [], fullText: '' };
-    extractFromEvent('gemini', {
-        type: 'message',
-        role: 'assistant',
-        content: 'gemini answer',
-    }, geminiCtx, 'gemini-agent');
-    extractFromEvent('gemini', {
-        type: 'result',
-        stats: { duration_ms: 987, tool_calls: 2 },
-    }, geminiCtx, 'gemini-agent');
-    assert.equal(geminiCtx.fullText, 'gemini answer');
-    assert.equal(geminiCtx.duration, 987);
-    assert.equal(geminiCtx.turns, 2);
 
     const opencodeCtx = { toolLog: [], fullText: '' };
     extractFromEvent('opencode', {
@@ -398,8 +461,6 @@ test('extractFromEvent updates context for each CLI path', () => {
 });
 
 test('extractToolLabel keeps backward compatibility and claude keys are deterministic', () => {
-    const first = extractToolLabel('gemini', { type: 'tool_result', status: 'failed' });
-    assert.deepEqual(first, { icon: '❌', label: 'failed', toolType: 'tool', stepRef: 'gemini:tool:tool', status: 'error' });
 
     const keyFromIndex = makeClaudeToolKeyForTest(
         { type: 'stream_event', event: { index: 3 } },
@@ -460,20 +521,6 @@ test('P2-3.6: Codex turn.completed stores cached_input_tokens', () => {
     assert.deepEqual(ctx.tokens, { input_tokens: 100, output_tokens: 50, cached_input_tokens: 30 });
 });
 
-test('P2-3.7: Gemini init stores model', () => {
-    const ctx = { toolLog: [], fullText: '' };
-    extractFromEvent('gemini', { type: 'init', model: 'gemini-3-flash-preview' }, ctx, 'gemini');
-    assert.equal(ctx.model, 'gemini-3-flash-preview');
-});
-
-test('P2-3.8: Gemini delta message pushes trace', () => {
-    const ctx = { toolLog: [], fullText: '', traceLog: [] };
-    extractFromEvent('gemini', {
-        type: 'message', role: 'assistant', content: 'partial', delta: true,
-    }, ctx, 'gemini');
-    assert.equal(ctx.fullText, 'partial');
-    assert.ok(ctx.traceLog.some(l => l.includes('gemini delta text')));
-});
 
 test('P2-3.10: OpenCode step_start stores model', () => {
     const ctx = { toolLog: [], fullText: '', traceLog: [] };
@@ -1097,11 +1144,7 @@ test('21.3: OpenCode task tool is marked as subagent and absorbs same callID too
     assert.equal(ctx.toolLog[0].status, 'done');
 });
 
-test('extractOutputChunk returns live assistant text for gemini, opencode final step, and codex', () => {
-    assert.equal(
-        extractOutputChunk('gemini', { type: 'message', role: 'assistant', content: 'hello', delta: true }),
-        'hello',
-    );
+test('extractOutputChunk returns live assistant text for opencode final step and codex', () => {
     const opencodeCtx = { pendingOutputChunk: '' };
     extractFromEvent('opencode', { type: 'text', part: { text: 'world' } }, opencodeCtx, 'oc');
     assert.equal(
@@ -1354,41 +1397,6 @@ test('grok trace backfill marks explicit failed result metadata as error', () =>
 });
 
 test('assistant output segments use a single markdown line break boundary', () => {
-    const geminiCtx = { toolLog: [], fullText: '', traceLog: [] };
-    const firstGemini = { type: 'message', role: 'assistant', content: 'a답변', delta: true };
-    const secondGemini = { type: 'message', role: 'assistant', content: 'b답변', delta: true };
-
-    extractFromEvent('gemini', firstGemini, geminiCtx, 'gemini');
-    assert.equal(extractOutputChunk('gemini', firstGemini, geminiCtx), 'a답변');
-    extractFromEvent('gemini', secondGemini, geminiCtx, 'gemini');
-    assert.equal(extractOutputChunk('gemini', secondGemini, geminiCtx), 'b답변');
-    assert.equal(geminiCtx.fullText, 'a답변b답변');
-
-    const koreanCtx = { toolLog: [], fullText: '', traceLog: [] };
-    const firstKorean = { type: 'message', role: 'assistant', content: '정', delta: true };
-    const secondKorean = { type: 'message', role: 'assistant', content: '확도', delta: true };
-    extractFromEvent('gemini', firstKorean, koreanCtx, 'gemini');
-    assert.equal(extractOutputChunk('gemini', firstKorean, koreanCtx), '정');
-    extractFromEvent('gemini', secondKorean, koreanCtx, 'gemini');
-    assert.equal(extractOutputChunk('gemini', secondKorean, koreanCtx), '확도');
-    assert.equal(koreanCtx.fullText, '정확도');
-
-    const splitCtx = { toolLog: [], fullText: '', traceLog: [] };
-    const firstSplit = { type: 'message', role: 'assistant', content: 'BETA /tmp/cli', delta: true };
-    const secondSplit = { type: 'message', role: 'assistant', content: '-jaw', delta: true };
-    extractFromEvent('gemini', firstSplit, splitCtx, 'gemini');
-    assert.equal(extractOutputChunk('gemini', firstSplit, splitCtx), 'BETA /tmp/cli');
-    extractFromEvent('gemini', secondSplit, splitCtx, 'gemini');
-    assert.equal(extractOutputChunk('gemini', secondSplit, splitCtx), '-jaw');
-    assert.equal(splitCtx.fullText, 'BETA /tmp/cli-jaw');
-
-    const boundaryCtx = { toolLog: [], fullText: '', traceLog: [] };
-    extractFromEvent('gemini', { type: 'message', role: 'assistant', content: 'I will check.', delta: true }, boundaryCtx, 'gemini');
-    extractFromEvent('gemini', { type: 'tool_use', tool_name: 'run_shell_command', tool_id: 't1', parameters: { command: 'pwd' } }, boundaryCtx, 'gemini');
-    extractFromEvent('gemini', { type: 'tool_result', tool_id: 't1', status: 'success', output: '/tmp' }, boundaryCtx, 'gemini');
-    extractFromEvent('gemini', { type: 'message', role: 'assistant', content: 'Done.', delta: true }, boundaryCtx, 'gemini');
-    assert.equal(boundaryCtx.fullText, 'I will check.\n- Done.');
-
     const codexCtx = { toolLog: [], fullText: '', seenToolKeys: new Set() };
     extractFromEvent('codex', { type: 'item.completed', item: { type: 'agent_message', id: 'm1', text: 'first' } }, codexCtx, 'codex');
     assert.equal(extractOutputChunk('codex', {}, codexCtx), 'first');
@@ -1811,98 +1819,6 @@ test('opencode marks unresolved bash exec as done when the step finishes cleanly
     assert.equal(ctx.toolLog[0].icon, '✅');
 });
 
-// ─── #107 Gemini thought/thinking filtering ───
-
-test('#107: extractOutputChunk skips Gemini thought events', () => {
-    // Standalone thought event type (future Gemini CLI)
-    assert.equal(
-        extractOutputChunk('gemini', { type: 'thought', content: 'internal reasoning' }),
-        '',
-    );
-    // Message event with thought flag
-    assert.equal(
-        extractOutputChunk('gemini', { type: 'message', role: 'assistant', content: 'thinking...', thought: true }),
-        '',
-    );
-    // Normal message still works
-    assert.equal(
-        extractOutputChunk('gemini', { type: 'message', role: 'assistant', content: 'hello' }),
-        'hello',
-    );
-});
-
-test('#107: extractOutputChunk filters thought parts from array content', () => {
-    const event = readFixture('gemini-message-with-thought.json');
-    const chunk = extractOutputChunk('gemini', event);
-    assert.equal(chunk, 'The current directory is /home/user.');
-    assert.ok(!chunk.includes('thought'));
-});
-
-test('#107: extractFromEvent skips Gemini thought events from fullText', () => {
-    const ctx = { toolLog: [], fullText: '', traceLog: [] };
-
-    // Thought event should not accumulate
-    extractFromEvent('gemini', {
-        type: 'thought',
-        content: 'Let me reason about this...',
-    }, ctx, 'gemini');
-    assert.equal(ctx.fullText, '');
-    assert.ok(ctx.traceLog.some(l => l.includes('thought (hidden)')));
-
-    // Message with thought=true should not accumulate
-    extractFromEvent('gemini', {
-        type: 'message',
-        role: 'assistant',
-        content: 'internal thinking',
-        thought: true,
-    }, ctx, 'gemini');
-    assert.equal(ctx.fullText, '');
-
-    // Normal message should still accumulate
-    extractFromEvent('gemini', {
-        type: 'message',
-        role: 'assistant',
-        content: 'final answer',
-        delta: true,
-    }, ctx, 'gemini');
-    assert.equal(ctx.fullText, 'final answer');
-});
-
-test('#107: extractFromEvent filters thought parts from array content', () => {
-    const ctx = { toolLog: [], fullText: '', traceLog: [] };
-    const event = readFixture('gemini-message-with-thought.json');
-    extractFromEvent('gemini', event, ctx, 'gemini');
-    assert.equal(ctx.fullText, 'The current directory is /home/user.');
-    assert.ok(!ctx.fullText.includes('should check'));
-});
-
-test('#121: Gemini thoughts can be surfaced as thinking steps without entering fullText', () => {
-    const thoughtCtx = { toolLog: [], fullText: '', traceLog: [], showReasoning: true };
-    extractFromEvent('gemini', {
-        type: 'thought',
-        content: 'I should inspect the repository first.',
-    }, thoughtCtx, 'gemini');
-    assert.equal(thoughtCtx.fullText, '');
-    assert.equal(thoughtCtx.toolLog.length, 1);
-    assert.equal(thoughtCtx.toolLog[0].toolType, 'thinking');
-    assert.equal(thoughtCtx.toolLog[0].detail, 'I should inspect the repository first.');
-    assert.ok(thoughtCtx.traceLog.some(l => l.includes('thought (visible)')));
-
-    const hiddenCtx = { toolLog: [], fullText: '', traceLog: [], showReasoning: false };
-    extractFromEvent('gemini', readFixture('gemini-message-with-thought.json'), hiddenCtx, 'gemini');
-    assert.equal(hiddenCtx.fullText, 'The current directory is /home/user.');
-    assert.equal(hiddenCtx.toolLog.length, 0);
-});
-
-test('#107: extractOutputChunk handles null elements in content array', () => {
-    const chunk = extractOutputChunk('gemini', {
-        type: 'message',
-        role: 'assistant',
-        content: [null, { type: 'text', text: 'safe' }, undefined, { type: 'thought', thought: 'hidden' }],
-    });
-    assert.equal(chunk, 'safe');
-});
-
 test('claude-e streaming does not duplicate output in liveRun', async () => {
     const { beginLiveRun, getLiveRun, appendLiveRunText, clearLiveRun } = await import('../src/agent/live-run-state.ts');
     const scope = 'unit-test-dedup-' + Date.now();
@@ -1979,4 +1895,89 @@ test('events.ts facade exports exactly the 12 public symbols', () => {
         'summarizeToolInput',
     ].sort();
     assert.deepEqual(allExports, expected, `events.ts must export exactly 12 symbols, got: ${allExports.join(', ')}`);
+});
+
+test('args invariant: only plain claude passes --include-partial-messages', async () => {
+    const { buildArgs, buildResumeArgs } = await import('../src/agent/args.ts');
+    const claudeArgs = buildArgs('claude', 'claude-sonnet-5', 'medium', 'p', 's');
+    const claudeEArgs = buildArgs('claude-e', 'claude-sonnet-5', 'medium', 'p', 's');
+    assert.ok(claudeArgs.includes('--include-partial-messages'), 'plain claude streams partial messages');
+    assert.ok(!claudeEArgs.includes('--include-partial-messages'), 'claude-e must not stream partial messages');
+    const claudeResume = buildResumeArgs('claude', 'claude-sonnet-5', 'medium', 'sid', 'p');
+    const claudeEResume = buildResumeArgs('claude-e', 'claude-sonnet-5', 'medium', 'sid', 'p');
+    assert.ok(claudeResume.includes('--include-partial-messages'), 'plain claude resume keeps the flag');
+    assert.ok(!claudeEResume.includes('--include-partial-messages'), 'claude-e resume must not gain the flag');
+});
+
+test('claude reconcile is skipped when the complete block has no text (streamed text survives)', () => {
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false };
+    extractFromEvent('claude', {
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'streamed prose' } },
+    }, ctx, 'test');
+    // Degenerate complete block with no text content must not delete the streamed text.
+    extractFromEvent('claude', {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+    }, ctx, 'test');
+    assert.equal(ctx.fullText, 'streamed prose', 'truncation must not run without canonical text');
+    assert.ok(!ctx.claudeStreamedText, 'per-message flag still resets');
+    assert.equal(ctx.claudeStreamedTextStart, undefined, 'anchor still resets');
+});
+
+// ─── WP4 (devlog 260703 doc 12): durable tool-row convergence via event flow ───
+
+test('WP4: codex running→done replacement carries the trace pointer and converges one row', () => {
+    const runId = startTraceRun({ cli: 'codex', audience: 'public' });
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false, traceRunId: runId, traceAudience: 'public' };
+
+    extractFromEvent('codex', {
+        type: 'item.started',
+        item: { type: 'command_execution', id: 'it1', command: 'ls -la' },
+    }, ctx, 'test');
+    assert.equal(ctx.toolLog.length, 1);
+    assert.equal(ctx.toolLog[0].status, 'running');
+    const stampedSeq = ctx.toolLog[0].traceSeq;
+    assert.equal(ctx.toolLog[0].traceRunId, runId);
+    assert.ok(stampedSeq >= 1);
+
+    extractFromEvent('codex', {
+        type: 'item.completed',
+        item: { type: 'command_execution', id: 'it1', command: 'ls -la', exit_code: 0 },
+    }, ctx, 'test');
+    assert.equal(ctx.toolLog.length, 1, 'done label must replace the running entry');
+    assert.equal(ctx.toolLog[0].status, 'done');
+    assert.equal(ctx.toolLog[0].traceRunId, runId, 'replacement must inherit the trace pointer');
+    assert.equal(ctx.toolLog[0].traceSeq, stampedSeq);
+
+    assert.equal(countToolTraceRows(runId), 1, 'no duplicate row for the replacement');
+    const rows = listToolEntriesForRun(runId);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, 'done', 'durable row must converge to final status');
+});
+
+test('WP4: claude tool_result converges the trace row even after RAM eviction', () => {
+    const runId = startTraceRun({ cli: 'claude', audience: 'public' });
+    const ctx = { toolLog: [], fullText: '', seenToolKeys: new Set(), hasClaudeStreamEvents: false, traceRunId: runId, traceAudience: 'public' };
+
+    extractFromEvent('claude', {
+        type: 'stream_event',
+        event: { type: 'content_block_start', content_block: { type: 'tool_use', id: 'tu_1', name: 'Bash' } },
+    }, ctx, 'test');
+    assert.equal(ctx.toolLog.length, 1);
+    assert.equal(ctx.toolLog[0].traceRunId, runId);
+
+    // Simulate the RAM cap evicting the placeholder before the result arrives.
+    ctx.toolLog.length = 0;
+
+    extractFromEvent('claude', {
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: [{ type: 'text', text: 'ok' }] }] },
+    }, ctx, 'test');
+
+    const rows = listToolEntriesForRun(runId);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, 'done', 'evicted placeholder must still converge via toolTraceIndex');
+    assert.equal(rows[0].icon, '✅');
+    assert.equal(rows[0].detail, 'ok');
 });

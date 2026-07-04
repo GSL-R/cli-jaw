@@ -90,6 +90,12 @@ export function buildGoalContinuation(): GoalContinuationResult {
         'MULTI-PHASE LOOP: if the goal is a multi-pass / "loop" task and work-phases remain after a completed PABCD cycle (state is IDLE), start the next work-phase with `cli-jaw orchestrate P`. Do not treat one completed cycle as the whole goal.',
         '',
         '**Quality Gates**: no placeholder evidence (todo, tbd, stub, fake pass); artifact paths required in all validation summaries.',
+        '',
+        // PABCD turns get the full discipline via the orchestration.md template;
+        // this compact line covers non-PABCD score-goal turns only (prompt budget).
+        ...(!pabcdActive
+            ? ['**Optimization-loop (score goals)**: classify each candidate (parameter-tweak | branch-toggle | state-space-redesign | evaluator-change); 3 same-class discards → target the evaluation gate next (LOOP-PHASE-DEATH-01); P quotes the previous D conclusion; candidates from domain-state evidence, not code parameters; an optimistic local proxy is never sole acceptance evidence. Full: dev-pabcd §10, dev-testing §9.5.']
+            : []),
         ...(goal.goalMode === 'plan'
             ? [
                 '',
@@ -161,6 +167,7 @@ export function buildGoalContinuation(): GoalContinuationResult {
                 '- Dispatch a CLI sub-agent or jaw employee to challenge whether viable work remains. A viable path → continue working. No path confirmed → call `cli-jaw goal pause --agent --audit "<reviewer summary>"`.',
                 '',
                 'RULE: Do not leave this gate in a loop. Either second-tap pause with audit evidence, or make productive progress and log a checkpoint.',
+                'If the goal appears complete, do not mark it done here; re-check the evidence once, then second-tap pause for the user to finalize.',
               ]
             : []),
         '',
@@ -172,6 +179,7 @@ export function buildGoalContinuation(): GoalContinuationResult {
         '- If the independent reviewer confirms no reasonable path remains, run `cli-jaw goal pause --agent --audit "<independent reviewer summary>"`.',
         '- Plain `cli-jaw goal pause` is for manual user commands only; AI goal continuations must use the agent/audit form.',
         '- The completion command is reserved for explicit user-requested final completion — only when current evidence proves EVERY requirement satisfied and NO work remains.',
+        '- If completion seems proven but the user did not explicitly ask to finalize, pause with audit evidence instead of using `goal done`.',
         '',
         '--- When to stop ---',
         '- If you genuinely cannot proceed with current tools/capabilities (runtime auth, hardware access, human judgment on a business decision), finish what you can, complete the Stop/Pause Audit above, pause with the agent/audit form, and report what was completed vs what remains.',

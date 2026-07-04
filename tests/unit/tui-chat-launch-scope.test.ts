@@ -38,7 +38,7 @@ test('fullscreen welcome remains in the launch prelude instead of pre-render std
 });
 
 test('fullscreen scrollback commit uses queue+render pattern with transactional mark', () => {
-    const commitStart = frameSource.indexOf('queueCommitLines(lines: string[]): void');
+    const commitStart = frameSource.indexOf('queueCommitLines(lines: string[]): boolean');
     const commitEnd = frameSource.indexOf('lastCommitFlushedCount(): number', commitStart);
     const commitBlock = frameSource.slice(commitStart, commitEnd);
 
@@ -62,7 +62,7 @@ test('fullscreen resize uses JWC-like clear before transcript and protects histo
     assert.ok(frameSource.includes("resizeRepaintMode(widthChanged: boolean, heightChanged: boolean): 'discard-scrollback' | 'visible-clear' | 'viewport-only'"));
     assert.ok(frameSource.includes('buildViewportRepaintSequence'));
     assert.ok(frameSource.includes("buildFullClearSequence(mode === 'discard-scrollback')"));
-    assert.ok(frameSource.includes('return buildFullClearSequence(true);'));
+    assert.ok(frameSource.includes('return buildFullClearSequence(!isForeignMultiplexer());'));
     assert.ok(resizeBlock.includes([
         'viewport.setWidth(process.stdout.columns || 80);',
         '        screen.forceResizeRedraw();',

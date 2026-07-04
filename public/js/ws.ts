@@ -68,6 +68,8 @@ interface WsMessage {
     detailAvailable?: boolean;
     detailBytes?: number;
     rawRetentionStatus?: string;
+    /** Server run-start (ms) riding on agent_tool — authoritative elapsed origin. */
+    startedAt?: number;
     text?: string;
     toolLog?: { icon: string; label: string; detail?: string; toolType?: string; stepRef?: string; isEmployee?: boolean; traceRunId?: string; traceSeq?: number; detailAvailable?: boolean; detailBytes?: number; rawRetentionStatus?: string }[];
     from?: string;
@@ -964,8 +966,11 @@ function handleServerEvent(msg: WsMessage): void {
             detailBytes: msg.detailBytes,
             rawRetentionStatus: msg.rawRetentionStatus,
             status: (msg.status as 'running' | 'done' | 'error') || 'running',
-            startTime: Date.now(),
-        });
+            // Server run start beats client arrival time: the elapsed-timer origin
+            // falls back to steps[0].startTime when pb.startedAt is lost on DOM
+            // reconstruct, and an arrival-time origin resets it to ~0 (WP4b).
+            startTime: typeof msg.startedAt === 'number' && msg.startedAt > 0 ? msg.startedAt : Date.now(),
+        }, typeof msg.startedAt === 'number' && msg.startedAt > 0 ? msg.startedAt : undefined);
         rememberAppliedToolSeq(toolRunId, toolSeq);
     } else if (msg.type === 'agent_output' || msg.type === 'agent_chunk') {
         if (isRecentSteer()) return;

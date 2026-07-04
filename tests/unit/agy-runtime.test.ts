@@ -6,9 +6,14 @@ import { dirname, join } from 'node:path';
 import {
     AGY_COMPLETE_KILL_REASON,
     AGY_FALLBACK_QUIET_COMPLETION_MS,
+    AGY_FULLTEXT_MAX_CHARS,
+    AGY_FULLTEXT_TRUNCATION_NOTICE,
+    AGY_LIVE_DISPLAY_MAX_CHARS,
     AGY_PRINT_QUIET_COMPLETION_MS,
-    AGY_TOOL_TRACE_FAILURE_MESSAGE,
+    appendAgyFullText,
+    describeAgyFinalSource,
     extractAgyConversationId,
+    finalizeAgyFallbackText,
     formatAgyTimeoutMessage,
     formatAgyTranscriptErrorMessage,
     getAgyQuietCompletionDelayMs,
@@ -18,11 +23,13 @@ import {
     normalizeAgyCloseText,
     resolveAgyEmptyCloseError,
     shouldCompleteAgyPrintRun,
+    shouldFreezeAgyLiveDisplay,
     stripAgyPromptEchoPrefix,
     stripAgyResumeReplayPrefix,
     stripAgyResumeReplayPrefixes,
     stripAgyTrailingTimeoutOutput,
 } from '../../src/agent/agy-runtime.ts';
+import { resolveSpawnOutputText } from '../../src/agent/events/helpers.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -62,31 +69,6 @@ test('AGY-RT-002b: formats unresolved AGY transcript provider errors', () => {
         }),
         null,
     );
-});
-
-test('AGY-RT-002c: detects leaked internal tool-planning output', () => {
-    const leaked = [
-        "🔮 toolAction: '성찰 버퍼 읽기'",
-        "toolSummary: '성찰 버퍼 확인'",
-        "AbsolutePath: '/home/test/.cli-jaw/memory/structured/inner_life/reflections.md'",
-        "toolAction: 'Viewing reflections'",
-        '<truncated 92507 bytes>',
-    ].join('\n');
-    assert.equal(isAgyInternalToolTraceOutput(leaked), true);
-    assert.equal(isAgyInternalToolTraceOutput([
-        'my_tool_call_analysis:',
-        '- Tool: run_command',
-        '- toolAction: 백업 실행',
-        '- Arguments:',
-        '  - CommandLine: "python3 backup.py"',
-    ].join('\n')), true);
-    assert.equal(isAgyInternalToolTraceOutput("toolAction이라는 문자열을 분석한 정상 답변이에요."), false);
-    assert.equal(isAgyInternalToolTraceOutput('정상적인 최종 답변입니다.'), false);
-    assert.match(AGY_TOOL_TRACE_FAILURE_MESSAGE, /without a user-facing final answer/);
-
-    const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /isAgyInternalToolTraceOutput\(ctx\.fullText\)/);
-    assert.match(spawnSrc, /eventType:\s*'invalid_final_output'/);
 });
 
 test('AGY-RT-003: extracts exact native AGY conversation ids from resume hints', () => {
@@ -140,7 +122,7 @@ test('AGY-RT-007: AGY stdout strips ANSI before persistence and sanitized trace 
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     assert.match(spawnSrc, /rawText\s*=\s*agyUtf8!\.write\(chunk\)/);
     assert.match(spawnSrc, /rawText\.replace\(\/\\x1B/);
-    assert.match(spawnSrc, /ctx\.fullText\s*\+=\s*text/);
+    assert.match(spawnSrc, /appendAgyFullText\(ctx,\s*text\)/);
     const agyStdoutStart = spawnSrc.indexOf('const rawText = agyUtf8!.write(chunk)');
     assert.ok(agyStdoutStart >= 0, 'AGY stdout decoder block must exist');
     const agyStdoutBlock = spawnSrc.slice(
@@ -170,26 +152,34 @@ test('AGY-RT-008: AGY print timeout is a hard cap while cli-jaw watchdog owns pr
     assert.match(spawnSrc, /startAgyTranscriptWatcher\(\{[\s\S]*ctx,/);
 });
 
-test('AGY-RT-017: AGY spill prompt keeps critical Arona bootstrap in argv prompt', () => {
+test('AGY-RT-008b: AGY and Kiro raw stdout/stderr activity marks watchdog progress', () => {
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /loadAgySpillRuntimeBootstrap/);
-    assert.match(spawnSrc, /canonical-routes\.json/);
-    assert.match(spawnSrc, /serializeAgyCompactRoutes/);
-    assert.match(spawnSrc, /You are Arona/);
-    assert.match(spawnSrc, /buildAgySpillArgPrompt/);
-    assert.match(spawnSrc, /Telegram boundary/);
-    assert.match(spawnSrc, /Search boundary/);
-    assert.match(spawnSrc, /Read-only closure/);
-    assert.match(spawnSrc, /Async closure/);
-    assert.match(spawnSrc, /Paired persistence/);
-    assert.match(spawnSrc, /ask whether to add it/);
-    assert.match(spawnSrc, /wait or poll in this run/);
-    assert.match(spawnSrc, /cumulative, not alternatives/);
-    assert.match(spawnSrc, /formatting-only edits and machine-only maintenance/);
-    assert.match(spawnSrc, /diary_pair\.py/);
-    assert.match(spawnSrc, /Do not use cli-jaw memory save/);
-    assert.match(spawnSrc, /promptForArgs = agyBootstrap\.prompt/);
-    assert.match(spawnSrc, /prepareAgyPromptWorkspace\([\s\S]*sysPrompt \|\| '',[\s\S]*promptForArgs,[\s\S]*spawnCwd/);
+    const agyStdoutStart = spawnSrc.indexOf('const rawText = agyUtf8!.write(chunk)');
+    assert.ok(agyStdoutStart >= 0, 'AGY stdout decoder block must exist');
+    const agyStdoutBlock = spawnSrc.slice(
+        agyStdoutStart,
+        spawnSrc.indexOf("if (kiroPlainText) {", agyStdoutStart),
+    );
+    assert.match(agyStdoutBlock, /const rawText = agyUtf8!\.write\(chunk\);/);
+    assert.match(agyStdoutBlock, /if \(!rawText\) return;\s*ctx\.stallWatchdog\?\.markProgress\(\);/);
+
+    const kiroStdoutStart = spawnSrc.indexOf("if (kiroPlainText) {");
+    assert.ok(kiroStdoutStart >= 0, 'Kiro stdout block must exist');
+    const kiroStdoutBlock = spawnSrc.slice(
+        kiroStdoutStart,
+        spawnSrc.indexOf('buffer += chunk.toString();', kiroStdoutStart),
+    );
+    assert.match(kiroStdoutBlock, /const text = kiroUtf8!\.write\(chunk\);/);
+    assert.match(kiroStdoutBlock, /if \(!text\) return;\s*ctx\.stallWatchdog\?\.markProgress\(\);/);
+    assert.match(kiroStdoutBlock, /appendTraceEvent\(\{[\s\S]*raw:\s*text/);
+
+    const stderrStart = spawnSrc.indexOf("child.stderr.on('data'");
+    assert.ok(stderrStart >= 0, 'stderr handler must exist');
+    const stderrBlock = spawnSrc.slice(
+        stderrStart,
+        spawnSrc.indexOf("child.on('close'", stderrStart),
+    );
+    assert.match(stderrBlock, /if \(\(kiroPlainText \|\| cli === 'agy'\) && text\) ctx\.stallWatchdog\?\.markProgress\(\);/);
 });
 
 test('AGY-RT-009: AGY print runs can finish after quiet assistant output', () => {
@@ -222,14 +212,6 @@ test('AGY-RT-010: AGY quiet completion is mapped to lifecycle success, not inter
     assert.match(spawnSrc, /wasKilled\s*=\s*!!stdKillReason\s*&&\s*!agyCompletedByQuietOutput/);
     assert.match(spawnSrc, /effectiveExitCode\s*=\s*agyCompletedByQuietOutput && !agyTranscriptErrorMessage[\s\S]*\?\s*0/);
     assert.match(spawnSrc, /getAgyQuietCompletionDelayMs\(ctx\)/);
-});
-
-test('AGY-RT-010b: watchdog kills preserve diagnostics and repeated nudges keep the original task', () => {
-    const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /killReasons\.set\(child\.pid, detail\)/);
-    assert.match(spawnSrc, /killReasons\.set\(child\.pid, reason\)/);
-    assert.match(spawnSrc, /isMinimalRecoveryNudge\(incomingTaskPrompt\)/);
-    assert.match(spawnSrc, /promptPreview:\s*interruptionTaskPreview/);
 });
 
 test('AGY-RT-011: AGY timeout suffix is stripped without masking timeout-only output', () => {
@@ -291,17 +273,26 @@ test('AGY-RT-012: AGY resume does not trim current stdout by prior output length
     assert.doesNotMatch(resumeOffsetBlock, /bucketRow\?\.output_len|employeeOutputLen/);
 });
 
-test('AGY-RT-012b: AGY uses cli-jaw history instead of native resume', () => {
+test('AGY-RT-012b: AGY native resume is opt-in and capability gated', () => {
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /const providerSupportsResume\s*=\s*cli !== 'agy'/);
+    assert.match(spawnSrc, /const agyNativeResumeEnabled = cli === 'agy'[\s\S]{0,120}shouldEnableAgyNativeResume\(cfg, agyCapabilities\)/);
+    assert.match(spawnSrc, /const providerSupportsResume = \(cli !== 'agy' \|\| agyNativeResumeEnabled\)/);
     assert.match(spawnSrc, /const needsHistory\s*=\s*!opts\._skipHistory && \(!isResume \|\| cli === 'pi'\)/);
 });
 
+test('AGY-RT-012b2: internal tool-planning output is not accepted as a final answer', () => {
+    assert.equal(isAgyInternalToolTraceOutput('my_tool_call_analysis:\n- Tool: run_command'), true);
+    assert.equal(isAgyInternalToolTraceOutput('toolAction: read\ntoolSummary: one\ntoolAction: read\ntoolSummary: two'), true);
+    assert.equal(isAgyInternalToolTraceOutput('Lands toolAction="write diary"\nNormal answer follows.'), false);
+    assert.equal(isAgyInternalToolTraceOutput('선생님, 작업을 완료했어요.'), false);
+});
+
 test('AGY-RT-012c: history injection treats prior context as read-only background', () => {
-    const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /Recent Context is read-only background/);
-    assert.match(spawnSrc, /Do not continue prior plans, audits, commands, questions, or goals/);
-    assert.match(spawnSrc, /\[Current Message\]/);
+    // The boundary strings moved from spawn.ts into the shared prompt-context module.
+    const contextSrc = readFileSync(join(__dirname, '../../src/agent/prompt-context.ts'), 'utf8');
+    assert.match(contextSrc, /Recent Context is read-only background/);
+    assert.match(contextSrc, /Do not continue prior plans, audits, commands, questions, or goals/);
+    assert.match(contextSrc, /\[Current Message\]/);
 });
 
 test('AGY-RT-012d: AGY prompt path uses bootstrap envelope after final spawn cwd', () => {
@@ -319,6 +310,17 @@ test('AGY-RT-012d: AGY prompt path uses bootstrap envelope after final spawn cwd
     assert.match(agyBootstrapBlock, /promptForArgs\s*=\s*agyBootstrap\.prompt/);
     assert.match(agyBootstrapBlock, /argOptions\s*=\s*\{\s*\.\.\.argOptions,\s*workingDir:\s*spawnCwd\s*\}/);
     assert.match(agyBootstrapBlock, /args\s*=\s*buildCurrentArgs\(argOptions\)/);
+});
+
+test('AGY-RT-012e: AGY prompt spill metadata is attached safely after bootstrap exists', () => {
+    const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
+    const ctxIdx = spawnSrc.indexOf('const ctx: SpawnContext = {');
+    const lifecycleIdx = spawnSrc.indexOf('let agyClosing', ctxIdx);
+    assert.ok(ctxIdx >= 0);
+    const ctxBlock = spawnSrc.slice(ctxIdx, lifecycleIdx);
+    assert.match(ctxBlock, /metadata:\s*\{\s*agyPromptSpill:\s*agyBootstrap\.spill\s*\}/);
+    assert.match(ctxBlock, /agyBootstrapSentinel:\s*agyBootstrap\.sentinel/);
+    assert.doesNotMatch(ctxBlock, /agyBootstrap\.prompt/);
 });
 
 test('AGY-RT-013: AGY resume replay prefix is stripped only when new output remains', () => {
@@ -454,7 +456,7 @@ test('AGY-RT-014: AGY quiet completion is anchored on the final transcript plann
     }), null);
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
     assert.match(spawnSrc, /getAgyQuietCompletionDelayMs\(ctx\)/);
-    assert.match(spawnSrc, /onActivity:\s*\(\)\s*=>\s*\{[\s\S]*?markProgress\(\);[\s\S]*?scheduleAgyQuietCompletion\(\);\s*\}/);
+    assert.match(spawnSrc, /onActivity:\s*\(\)\s*=>\s*\{[\s\S]*?scheduleAgyQuietCompletion\(\);\s*\}/);
 });
 
 test('AGY-RT-015: transcript watcher drives the final planner flag and growth activity', () => {
@@ -471,12 +473,9 @@ test('AGY-RT-015: transcript watcher drives the final planner flag and growth ac
     assert.match(watcherSrc, /agyLastTranscriptError = error/);
     assert.match(watcherSrc, /agyLastTranscriptError = undefined/);
     assert.match(watcherSrc, /kind === 'provider-error'/);
-    assert.match(watcherSrc, /JAW_AGY_CHECKPOINT_STALL_MS/);
-    assert.match(watcherSrc, /rowType === 'CHECKPOINT'/);
-    assert.match(watcherSrc, /options\.onCheckpointStall\?\.\(/);
     // Fast-resume regression: a USER_INPUT row must clear a stale final-planner flag set
     // by the previous turn's row inside the lookback buffer.
-    assert.match(watcherSrc, /rowType === 'USER_INPUT' \|\| rowType === 'CHECKPOINT'/);
+    assert.match(watcherSrc, /rowType === 'USER_INPUT'/);
 });
 
 test('AGY-RT-016: AGY unresolved transcript provider error is finalized before smoke and lifecycle', () => {
@@ -493,4 +492,113 @@ test('AGY-RT-016: AGY unresolved transcript provider error is finalized before s
     assert.match(spawnSrc, /ctx\.fullText\s*=\s*''/);
     assert.match(spawnSrc, /ctx\.liveOutputText\s*=\s*''/);
     assert.match(spawnSrc, /appendTraceEvent\(\{[\s\S]*eventType:\s*'runtime_error'[\s\S]*agyTranscriptErrorMessage/);
+});
+
+test('AGY-RT-017: appendAgyFullText accumulates past the old 102,400 silent cap', () => {
+    const ctx = { fullText: '', agyFullTextTruncated: undefined as boolean | undefined };
+    const chunk = 'x'.repeat(60_000);
+    appendAgyFullText(ctx, chunk);
+    appendAgyFullText(ctx, chunk);
+    assert.equal(ctx.fullText.length, 120_000, 'must keep the full 120 KB (old cap silently stopped at 102,400)');
+    assert.equal(ctx.agyFullTextTruncated, undefined);
+});
+
+test('AGY-RT-018: appendAgyFullText slices at AGY_FULLTEXT_MAX_CHARS, flags, then no-ops', () => {
+    const ctx = { fullText: 'y'.repeat(AGY_FULLTEXT_MAX_CHARS - 10), agyFullTextTruncated: undefined as boolean | undefined };
+    appendAgyFullText(ctx, 'z'.repeat(100));
+    assert.equal(ctx.fullText.length, AGY_FULLTEXT_MAX_CHARS);
+    assert.equal(ctx.agyFullTextTruncated, true);
+    appendAgyFullText(ctx, 'more');
+    assert.equal(ctx.fullText.length, AGY_FULLTEXT_MAX_CHARS, 'appends after the flag must be no-ops');
+});
+
+test('AGY-RT-019: live display freeze requires visible output first (quiet completion stays eligible)', () => {
+    const oversized = 'a'.repeat(AGY_LIVE_DISPLAY_MAX_CHARS + 1);
+    assert.equal(
+        shouldFreezeAgyLiveDisplay({ outputTextStarted: false, fullText: oversized }),
+        false,
+        'first oversized chunk must still run the display path so outputTextStarted gets set',
+    );
+    assert.equal(shouldFreezeAgyLiveDisplay({ outputTextStarted: true, fullText: oversized }), true);
+    assert.equal(shouldFreezeAgyLiveDisplay({ outputTextStarted: true, fullText: 'short' }), false);
+});
+
+test('AGY-RT-020: finalizeAgyFallbackText promotes the full body past a frozen live candidate', () => {
+    const fullBody = `intro\n${'b'.repeat(300_000)}\nfinal conclusion`;
+    const ctx = {
+        fullText: fullBody,
+        liveOutputText: fullBody.slice(0, 1_000),
+        agyFinalPlannerSeen: undefined as boolean | undefined,
+        agyFullTextTruncated: undefined as boolean | undefined,
+    };
+    assert.equal(finalizeAgyFallbackText(ctx, fullBody), true);
+    assert.equal(ctx.liveOutputText, fullBody);
+    // End-to-end: the agent_done resolver prefers display candidates; the promoted
+    // live candidate must deliver the full body (regression: frozen 1 KB masked it).
+    assert.equal(resolveSpawnOutputText(ctx), fullBody.trim());
+});
+
+test('AGY-RT-021: finalizeAgyFallbackText appends the truncation notice to both candidates', () => {
+    const ctx = {
+        fullText: 'body',
+        liveOutputText: 'body',
+        agyFinalPlannerSeen: undefined as boolean | undefined,
+        agyFullTextTruncated: true,
+    };
+    assert.equal(finalizeAgyFallbackText(ctx, 'body'), true);
+    assert.ok(ctx.fullText.endsWith(AGY_FULLTEXT_TRUNCATION_NOTICE));
+    assert.ok(ctx.liveOutputText.endsWith(AGY_FULLTEXT_TRUNCATION_NOTICE));
+
+    const noLive = {
+        fullText: 'body',
+        liveOutputText: undefined as string | undefined,
+        agyFinalPlannerSeen: undefined as boolean | undefined,
+        agyFullTextTruncated: true,
+    };
+    assert.equal(finalizeAgyFallbackText(noLive, 'body'), true);
+    assert.ok(noLive.fullText.endsWith(AGY_FULLTEXT_TRUNCATION_NOTICE));
+    assert.equal(noLive.liveOutputText, undefined);
+
+    // agy initializes liveOutputText to '' (spawn.ts) — distinct from undefined: the
+    // empty string is a live candidate, so it gets promoted first and then noticed.
+    const emptyLive = {
+        fullText: 'body',
+        liveOutputText: '' as string | undefined,
+        agyFinalPlannerSeen: undefined as boolean | undefined,
+        agyFullTextTruncated: true,
+    };
+    assert.equal(finalizeAgyFallbackText(emptyLive, 'body'), true);
+    assert.equal(emptyLive.liveOutputText, `body${AGY_FULLTEXT_TRUNCATION_NOTICE}`);
+    assert.ok(emptyLive.fullText.endsWith(AGY_FULLTEXT_TRUNCATION_NOTICE));
+});
+
+test('AGY-RT-022: finalizeAgyFallbackText no-ops for transcript-anchored or untouched runs', () => {
+    const planner = {
+        fullText: 'planner final',
+        liveOutputText: 'short',
+        agyFinalPlannerSeen: true,
+        agyFullTextTruncated: true,
+    };
+    assert.equal(finalizeAgyFallbackText(planner, 'anything longer than short'), false);
+    assert.equal(planner.liveOutputText, 'short');
+    assert.equal(planner.fullText, 'planner final');
+
+    const untouched = {
+        fullText: 'same',
+        liveOutputText: 'same body already longer',
+        agyFinalPlannerSeen: undefined as boolean | undefined,
+        agyFullTextTruncated: undefined as boolean | undefined,
+    };
+    assert.equal(finalizeAgyFallbackText(untouched, 'same'), false);
+});
+
+test('AGY-RT-023: describeAgyFinalSource reports mode and truncation for diagnosability', () => {
+    assert.equal(
+        describeAgyFinalSource({ agyFinalPlannerSeen: true, agyFinalPlannerText: 'x', agyFullTextTruncated: undefined, fullText: 'x' }),
+        '[jaw:agy:final] source=transcript chars=1 truncated=0',
+    );
+    assert.equal(
+        describeAgyFinalSource({ agyFinalPlannerSeen: undefined, agyFinalPlannerText: undefined, agyFullTextTruncated: true, fullText: 'abc' }),
+        '[jaw:agy:final] source=stdout-fallback chars=3 truncated=1',
+    );
 });

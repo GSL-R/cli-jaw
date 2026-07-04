@@ -4,6 +4,8 @@ export class AnsiTerminalModel {
     private col = 0;
     private scrollTop = 0;
     private scrollBottom: number;
+    /** Lines that left the screen through a top-anchored scroll region (terminal scrollback). */
+    readonly scrollback: string[] = [];
 
     constructor(private columns: number, private rows: number) {
         this.lines = new Array(rows).fill('');
@@ -70,6 +72,7 @@ export class AnsiTerminalModel {
         else if (command === 'J') this.eraseDisplay(n);
         else if (command === 'K' && n === 2) this.lines[this.row] = '';
         else if (command === 'r') this.setScrollRegion(params);
+        else if (command === 'M') this.deleteLines(n);
         return end;
     }
 
@@ -86,13 +89,39 @@ export class AnsiTerminalModel {
             this.scrollBottom = this.rows - 1;
             return;
         }
-        this.scrollTop = Math.max(0, Math.min(this.rows - 1, params[0] - 1));
-        this.scrollBottom = Math.max(this.scrollTop, Math.min(this.rows - 1, params[1] - 1));
+        const top = Math.max(0, Math.min(this.rows - 1, params[0] - 1));
+        const bottom = Math.max(0, Math.min(this.rows - 1, params[1] - 1));
+        // DECSTBM requires bottom > top: real terminals silently IGNORE a
+        // 1-row (or inverted) region — empirically verified against
+        // @xterm/headless in the jawcode sibling repo (CSI 1;1r is a no-op,
+        // the \r\n just moves the cursor and nothing enters scrollback).
+        // Accepting it here masked exactly that product bug.
+        if (bottom <= top) return;
+        this.scrollTop = top;
+        this.scrollBottom = bottom;
+    }
+
+    /** DL — delete n lines at the cursor row within the scroll region. Rows
+     *  below shift up, blanks open at the region bottom; NOTHING enters
+     *  scrollback (unlike a region-top-1 scroll). */
+    private deleteLines(n: number): void {
+        if (this.row < this.scrollTop || this.row > this.scrollBottom) return;
+        for (let k = 0; k < n; k += 1) {
+            for (let r = this.row; r < this.scrollBottom; r += 1) {
+                this.lines[r] = this.lines[r + 1] ?? '';
+            }
+            this.lines[this.scrollBottom] = '';
+        }
     }
 
     private eraseDisplay(mode: number): void {
         if (mode === 2 || mode === 3) {
             this.lines = new Array(this.rows).fill('');
+            // 3J erases the SAVED lines (terminal scrollback); 2J only the
+            // visible screen. Modeling both as visible-only made scrollback
+            // wipes (launch clear, discard-scrollback resize) invisible to
+            // assertions.
+            if (mode === 3) this.scrollback.length = 0;
             return;
         }
         if (mode === 0) {
@@ -111,6 +140,9 @@ export class AnsiTerminalModel {
 
     private lineFeed(): void {
         if (this.row === this.scrollBottom) {
+            // Region top at row 1 → the departing line enters scrollback
+            // (Ghostty PR #9907 semantics); top > 1 silently discards it.
+            if (this.scrollTop === 0) this.scrollback.push(this.lines[0] ?? '');
             for (let r = this.scrollTop; r < this.scrollBottom; r += 1) {
                 this.lines[r] = this.lines[r + 1] ?? '';
             }

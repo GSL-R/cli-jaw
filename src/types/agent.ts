@@ -2,6 +2,7 @@
 // Shared type definitions for agent spawn context objects.
 
 import type { WatchdogHandle } from '../agent/watchdog.js';
+import type { TracePointer } from '../trace/types.js';
 
 export interface ToolEntry {
   icon: string;
@@ -32,6 +33,16 @@ export type AgyBootstrapAcceptanceMode =
   | 'missing'
   | 'not-applicable';
 
+export type AgyTranscriptMode =
+  | 'not-started'
+  | 'anchored'
+  | 'bootstrap-missing'
+  | 'fallback-missing'
+  | 'fallback-timeout'
+  | 'provider-error';
+
+export type AgyLastActivitySource = 'stdout' | 'stderr' | 'transcript' | 'none';
+
 /** Context object created per spawnAgent() invocation. */
 export interface SpawnContext {
   fullText: string;
@@ -45,6 +56,12 @@ export interface SpawnContext {
    *  incl tool_use) — that would false-skip a tool-only turn whose prose arrives
    *  only in the complete assistant event. */
   claudeStreamedText?: boolean;
+  /** Wall-clock run start; rides on agent_tool broadcasts so the web UI's elapsed
+   * timer has one authoritative origin (WP3, zero-seconds bug). */
+  runStartedAt?: number;
+  /** Stream-target offset where the current message's raw text deltas began —
+   * consumed by the complete-block reconcile in handleClaudeEvent. */
+  claudeStreamedTextStart?: number | undefined;
   sessionId: string | null;
   cost: number | null;
   turns: number | null;
@@ -61,12 +78,15 @@ export interface SpawnContext {
   _parentSyncedCount?: number;
   traceRunId?: string;
   traceAudience?: 'public' | 'internal';
+  /** stepRef → trace pointer, populated at stamp time, so completion handlers can
+   *  converge the durable tool row even after the RAM cap evicted the entry
+   *  (WP4, devlog 260703 doc 12). */
+  toolTraceIndex?: Map<string, TracePointer>;
   // Phase 3: model/metadata storage
   model?: string;
   metadata?: Record<string, unknown>;
   finishReason?: string;
   pendingOutputChunk?: string;
-  geminiDeltaActive?: boolean;
   grokThoughtBuf?: string;
   grokCurrentThoughtRef?: string;
   grokThoughtSeq?: number;
@@ -90,8 +110,6 @@ export interface SpawnContext {
   cursorToolCallIds?: Set<string>;
   acpSubagentToolCallIds?: Set<string>;
   acpSubagentLabels?: Map<string, string>;
-  // Gemini watchdog flag (set on 'result' event, triggers kill timer in spawn.ts)
-  geminiResultSeen?: boolean;
   // Claude-specific stream buffers (set by events.ts extractFromEvent)
   claudeThinkingBuf?: string;
   claudeInputJsonBuf?: string;
@@ -109,6 +127,9 @@ export interface SpawnContext {
   agyResumeOffset?: number;
   agyBytesReceived?: number;
   agyTranscriptActive?: boolean;
+  agyTranscriptMode?: AgyTranscriptMode;
+  agyTranscriptLastReason?: string;
+  agyLastActivitySource?: AgyLastActivitySource;
   agyBootstrapSentinel?: string;
   agyBootstrapHash?: string;
   agyBootstrapAccepted?: boolean;
@@ -116,6 +137,8 @@ export interface SpawnContext {
   agyFinalPlannerSeen?: boolean;
   agyFinalPlannerText?: string | undefined;
   agyLastTranscriptError?: AgyTranscriptError | undefined;
+  /** Set when agy stdout accumulation hit AGY_FULLTEXT_MAX_CHARS (explicit, not silent). */
+  agyFullTextTruncated?: boolean;
   kiroDisplayedText?: string;
   kiroLineBuffer?: string;
   kiroToolSeq?: number;

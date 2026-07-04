@@ -11,6 +11,7 @@ import { RightSidebar } from './panels/RightSidebar';
 import { BottomPanel, type BottomPanelRenderControls } from './panels/BottomPanel';
 import { usePanelLayout } from './panels/PanelLayoutProvider';
 import { currentManagerSurface } from './panels/panel-capabilities';
+import { getDesktop } from './panels/desktop-bridge';
 import type { RightPanelMode, BottomPanelTab } from './panels/types';
 import type { FolderPanelSessionState } from './folder-panel/folder-panel-session';
 import type { WorkbenchRepoRootMode } from './workbench/workbench-resource-types';
@@ -65,7 +66,6 @@ import { ModeSwitch } from './code/ModeSwitch';
 const CodeCanvas = lazy(() => import('./code/CodeCanvas').then(m => ({ default: m.CodeCanvas })));
 import './code/code.css';
 import { useWorkbenchResourceState } from './workbench/useWorkbenchResourceState';
-import { WorkerProgressMonitorPanel } from './workers/WorkerProgressMonitorPanel';
 
 type WorkspaceSurfaceProps = {
     active: boolean;
@@ -74,6 +74,12 @@ type WorkspaceSurfaceProps = {
 
 function WorkspaceSurface(props: WorkspaceSurfaceProps) {
     return <section className={`workspace-surface${props.active ? ' is-active' : ''}`} hidden={!props.active} aria-hidden={!props.active}>{props.children}</section>;
+}
+
+function expandDesktopHomePath(path: string): string {
+    if (!path.startsWith('~/')) return path;
+    const home = getDesktop()?.getHomePath?.()?.replace(/\/+$/, '');
+    return home ? `${home}/${path.slice(2)}` : path;
 }
 
 type Props = {
@@ -200,7 +206,7 @@ function renderRightPanelContent(
             onSettingsPatch={onDashboardSettingsPatch}
         /></Suspense>;
         case 'folder': return <Suspense fallback={fallback}><FolderPanel selectedFilePath={previewFilePath} externalRootPath={folderRootPath} repoRootPath={repoRootMode === 'instance' ? repoRootPath : null} gitRefreshVersion={gitRefreshVersion} notesTree={notesModel.tree} notesRoot={notesModel.notesRoot} onRootChange={onFolderRootChange} onRepoRootChange={onRepoRootChange} onGitRefresh={onGitRefresh} onPreviewFile={onPreviewFile} sessionState={folderPanelSession} onSessionStateChange={onFolderPanelSessionChange} /></Suspense>;
-        case 'doc': return <Suspense fallback={fallback}><DocPanel filePath={previewFilePath ?? undefined} /></Suspense>;
+        case 'doc': return <Suspense fallback={fallback}><DocPanel filePath={previewFilePath ?? undefined} onOpenLocalFile={onPreviewFile} /></Suspense>;
         case 'browser': return <Suspense fallback={fallback}><BrowserPanel /></Suspense>;
         case 'ceo': return jawCeoPanel;
         default: return null;
@@ -284,7 +290,9 @@ export function SidebarRailRouter(props: Props) {
         && !props.notesSelectedNote.tags?.includes(props.notesModel.tagFilter),
     );
     function handleRightPreviewFile(path: string): void {
-        setActiveResource(path, 'doc');
+        const previewPath = expandDesktopHomePath(path.trim());
+        if (!previewPath) return;
+        setActiveResource(previewPath, 'doc');
         panelLayout.dispatch({ type: 'OPEN_RIGHT_PANEL', mode: 'doc', slot: 'bottom' });
     }
 
@@ -400,12 +408,9 @@ export function SidebarRailRouter(props: Props) {
                                 <div id="code-session-sidebar-host" className="code-session-sidebar-host" />
                             </section>
                         ) : (
-                            <>
-                                <InstanceNavigator active={props.selectedInstance} hiddenCount={props.instances.filter(instance => instance.hidden).length} collapsed={props.sidebarCollapsed}>
-                                    {props.instanceListContent}
-                                </InstanceNavigator>
-                                <WorkerProgressMonitorPanel />
-                            </>
+                            <InstanceNavigator active={props.selectedInstance} hiddenCount={props.instances.filter(instance => instance.hidden).length} collapsed={props.sidebarCollapsed}>
+                                {props.instanceListContent}
+                            </InstanceNavigator>
                         )}
                     </div>
                 </>
@@ -434,7 +439,7 @@ export function SidebarRailRouter(props: Props) {
                         {props.viewMode === 'code' && props.sidebarMode === 'instances' ? (
                             <WorkspaceSurface active>
                                 <Suspense fallback={<div style={{ padding: '24px', color: 'var(--text-dim)', fontSize: '13px' }}>Loading Code workspace...</div>}>
-                                    <CodeCanvas port={props.port} workingDir={codeWorkingDir} onWorkingDirChange={updateRightFolderRoot} />
+                                    <CodeCanvas port={props.port} workingDir={codeWorkingDir} onWorkingDirChange={updateRightFolderRoot} onOpenLocalFile={handleRightPreviewFile} />
                                 </Suspense>
                             </WorkspaceSurface>
                         ) : null}

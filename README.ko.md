@@ -5,7 +5,7 @@
 ### 나만의 AI 에이전트. 2줄이면 설치 끝. 13개 AI 런타임 표면을 하나의 대시보드에서.
 
 [![npm](https://img.shields.io/npm/v/cli-jaw)](https://npmjs.com/package/cli-jaw)
-[![Version](https://img.shields.io/badge/v2.2.2-GA-brightgreen)](https://github.com/lidge-jun/cli-jaw/releases)
+[![Version](https://img.shields.io/badge/v2.2.3-GA-brightgreen)](https://github.com/lidge-jun/cli-jaw/releases)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-blue)](https://typescriptlang.org)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.4-blue)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
@@ -185,7 +185,6 @@ kiro                 # AWS Kiro (AWS 계정 무료 티어)
 claude auth login    # Anthropic Claude Pro 이상
 codex login          # OpenAI ChatGPT Pro 이상
 cursor-agent login   # Cursor
-gemini               # Google Gemini Advanced
 grok login --oauth   # xAI Grok / Grok Heavy
 ```
 
@@ -201,7 +200,6 @@ grok login --oauth   # xAI Grok / Grok Heavy
  ✅ Claude CLI      installed
  ✅ Codex CLI       installed
  ✅ Cursor CLI      installed
- ⚠️ Gemini CLI      not found (optional)
  ✅ OpenCode CLI    installed
  ✅ Copilot CLI     installed
  ✅ Database        jaw.db OK
@@ -324,7 +322,6 @@ jaw worker status Backend
 | **Codex** | `gpt-5.5` | `codex login` | ChatGPT Pro 구독 이상 |
 | **Codex App** | `gpt-5.5` | `codex login` | ChatGPT Pro 구독 이상 |
 | **Cursor** | `composer-2.5` | `cursor-agent login` 또는 `CURSOR_API_KEY` | Cursor 구독; 쿼터는 인증/상태 전용 |
-| **Gemini** | `gemini-3-flash-preview` | `gemini` | Gemini Advanced 구독 |
 | **Grok** | `grok-build` | `grok login --oauth` | Grok 구독; 쿼터는 인증/상태 전용 |
 | **Kiro** | registry-selected | `kiro` | AWS Kiro 무료 티어 |
 | **OpenCode** | `opencode-go/kimi-k2.6` | `opencode` | 무료 모델 사용 가능 |

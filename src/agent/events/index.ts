@@ -8,7 +8,6 @@ export { summarizeToolInput, extractToolLabel, extractToolLabelsForTest, makeCla
 export { logEventSummary } from './summary.js';
 
 import type { SpawnContext, ToolEntry, CliEventRecord } from './types.js';
-import { asCliEventArray } from '../../types/cli-events.js';
 import { isClaudeLikeCli } from '../cli-helpers.js';
 import {
     syncLiveTools,
@@ -19,9 +18,9 @@ import {
     appendAssistantRawText,
 } from './helpers.js';
 import { handleClaudeEvent, handleClaudeRateLimitEvent, finalizeClaudeRateLimitOnResult } from './claude.js';
+import { updateTraceToolRow } from '../../trace/store.js';
 import { handleCodexEvent } from './codex.js';
 import { handleCursorEvent } from './cursor.js';
-import { handleGeminiEvent } from './gemini.js';
 import { handleGrokEvent } from './grok.js';
 import { handleOpenCodeEvent } from './opencode.js';
 import { extractToolLabels } from './tool-labels.js';
@@ -32,7 +31,6 @@ export function extractSessionId(cli: string, event: CliEventRecord): string | n
         case 'claude-e': return event.type === 'system' ? event.session_id ?? null : null;
         case 'codex': return event.type === 'thread.started' ? event.thread_id ?? null : null;
         case 'cursor': return event.session_id ?? event.sessionId ?? null;
-        case 'gemini': return event.type === 'init' ? event.session_id ?? null : null;
         case 'grok': return event.type === 'end' ? event.sessionId ?? null : null;
         case 'opencode': return event.sessionID ?? null;
         default: return null;
@@ -40,24 +38,6 @@ export function extractSessionId(cli: string, event: CliEventRecord): string | n
 }
 
 export function extractOutputChunk(cli: string, event: CliEventRecord, ctx?: SpawnContext): string {
-    if (cli === 'gemini') {
-        if (ctx?.pendingOutputChunk) {
-            const chunk = ctx.pendingOutputChunk;
-            ctx.pendingOutputChunk = '';
-            return chunk;
-        }
-        // [#107] Skip thought/thinking events (future-proofing for when Gemini CLI adds them)
-        if (event.type === 'thought' || event.thought === true) return '';
-        if (event.type === 'message' && event.role === 'assistant' && event.content) {
-            // Skip message events with thought content parts (ACP path)
-            if (Array.isArray(event.content)) {
-                const textParts = asCliEventArray(event.content).filter((p) => p.type === 'text');
-                return textParts.map((p) => String(p.text || '')).join('');
-            }
-            return String(event.content);
-        }
-        return '';
-    }
     if (cli === 'opencode') {
         if (ctx?.pendingOutputChunk) {
             const chunk = ctx.pendingOutputChunk;
@@ -171,8 +151,16 @@ export function extractFromEvent(cli: string, event: CliEventRecord, ctx: SpawnC
         // between segments and would corrupt mid-token deltas. Set per-message
         // claudeStreamedText so handleClaudeEvent skips the duplicate complete-block
         // append (and resets it) without false-skipping a tool-only turn.
-        if (inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta') {
-            const seg = appendAssistantRawText(ctx, inner.delta.text || '');
+        // Scoped to plain `claude`: the claude-e wrapper passes stream_event lines
+        // through, and a raw-appended claude-e delta would corrupt its snapshot path.
+        // claudeStreamedTextStart anchors the complete-block reconcile that restores
+        // segment boundaries between tool-separated messages (handleClaudeEvent).
+        if (cli === 'claude' && inner?.type === 'content_block_delta' && inner.delta?.type === 'text_delta') {
+            const deltaText = inner.delta.text || '';
+            if (deltaText && !ctx.claudeStreamedText && ctx.claudeStreamedTextStart === undefined) {
+                ctx.claudeStreamedTextStart = (ctx.liveOutputText ?? ctx.fullText).length;
+            }
+            const seg = appendAssistantRawText(ctx, deltaText);
             if (seg) {
                 // Arm the per-message guard only when real text flowed: an all-empty
                 // text_delta run must NOT skip the complete-block fallback (else its
@@ -264,6 +252,7 @@ export function extractFromEvent(cli: string, event: CliEventRecord, ctx: SpawnC
                         if (existing) {
                             existing.detail = detail;
                             syncLiveTools(ctx);
+                            updateTraceToolRow(existing);
                             // Re-broadcast with detail
                             emitAgentTool(ctx, agentLabel, existing, empTag);
                         }
@@ -323,11 +312,23 @@ export function extractFromEvent(cli: string, event: CliEventRecord, ctx: SpawnC
                 (t: ToolEntry) => t.stepRef === toolLabel.stepRef && t.status === 'running'
             );
             if (runIdx !== -1) {
+                // Carry the trace pointer onto the replacement: a fresh object would
+                // get stamped as a DUPLICATE row while the original row stays
+                // 'running' forever (WP4, devlog 260703 doc 12 item 2).
+                const prior = ctx.toolLog[runIdx];
+                if (prior?.traceRunId && prior.traceSeq) {
+                    toolLabel.traceRunId = prior.traceRunId;
+                    toolLabel.traceSeq = prior.traceSeq;
+                    if (prior.detailAvailable !== undefined) toolLabel.detailAvailable = prior.detailAvailable;
+                    if (prior.detailBytes !== undefined) toolLabel.detailBytes = prior.detailBytes;
+                    if (prior.rawRetentionStatus !== undefined) toolLabel.rawRetentionStatus = prior.rawRetentionStatus;
+                }
                 ctx.toolLog[runIdx] = toolLabel;
                 if (cli === 'opencode' && ctx.opencodePendingToolRefs) {
                     ctx.opencodePendingToolRefs = ctx.opencodePendingToolRefs.filter(ref => ref !== toolLabel.stepRef);
                 }
                 syncLiveTools(ctx);
+                updateTraceToolRow(toolLabel);
                 emitAgentTool(ctx, agentLabel, toolLabel, empTag);
                 continue;
             }
@@ -361,9 +362,6 @@ export function extractFromEvent(cli: string, event: CliEventRecord, ctx: SpawnC
             break;
         case 'cursor':
             handleCursorEvent(event, ctx, agentLabel, empTag);
-            break;
-        case 'gemini':
-            handleGeminiEvent(event, ctx, agentLabel, empTag);
             break;
         case 'grok':
             handleGrokEvent(event, ctx, agentLabel, empTag);
