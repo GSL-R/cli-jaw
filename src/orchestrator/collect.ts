@@ -17,6 +17,7 @@ export function orchestrateAndCollect(
 ): Promise<string> {
     return new Promise((resolve) => {
         let collected = '';
+        let hadToolActivity = false;
         let timeout: ReturnType<typeof setTimeout>;
         const IDLE_TIMEOUT = 1200000;
 
@@ -29,6 +30,7 @@ export function orchestrateAndCollect(
         }
 
         const handler = (type: string, data: Record<string, any>) => {
+            if (type === 'agent_tool') hadToolActivity = true;
             // Live assistant chunks arrive as agent_output (Web UI + spawn.ts); legacy alias agent_chunk.
             if (type === 'agent_chunk' || type === 'agent_output' || type === 'agent_tool' ||
                 type === 'agent_status' || type === 'agent_retry' ||
@@ -47,7 +49,14 @@ export function orchestrateAndCollect(
                 if (!meta?.["requestId"] && meta?.["chatId"] && data?.["chatId"] && data["chatId"] !== meta["chatId"]) return;
                 clearTimeout(timeout);
                 removeBroadcastListener(handler);
-                resolve(data["text"] || collected || t('tg.noResponse', {}, locale));
+                const doneText = typeof data["text"] === 'string' ? data["text"] : '';
+                if (doneText.trim()) resolve(doneText);
+                else if (collected.trim()) resolve(collected);
+                // AGY can exit 0 after completing heartbeat tools while its final
+                // [SILENT] transcript event races the tailer. Do not turn that
+                // intentional quiet completion into a user-visible failure.
+                else if (meta?.["origin"] === 'heartbeat' && hadToolActivity) resolve('[SILENT]');
+                else resolve(t('tg.noResponse', {}, locale));
             }
         };
         addBroadcastListener(handler);
