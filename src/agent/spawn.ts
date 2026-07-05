@@ -74,6 +74,7 @@ import {
     normalizeAgyCloseText,
     shouldFreezeAgyLiveDisplay,
     stripAgyPromptEchoPrefix,
+    stripAgyIntermediatePlannerPrefixes,
     stripAgyResumeReplayPrefix,
     stripAgyResumeReplayPrefixes,
 } from './agy-runtime.js';
@@ -2650,6 +2651,14 @@ export function spawnAgent(prompt: string, opts: SpawnOpts = {}): SpawnResult {
             if (ctx.agyFinalPlannerSeen && ctx.agyFinalPlannerText) {
                 ctx.fullText = ctx.agyFinalPlannerText;
                 if (ctx.liveOutputText !== undefined) ctx.liveOutputText = ctx.agyFinalPlannerText;
+            } else if (ctx.agyIntermediatePlannerTexts?.length) {
+                ctx.fullText = stripAgyIntermediatePlannerPrefixes(ctx.fullText, ctx.agyIntermediatePlannerTexts).text;
+                if (ctx.liveOutputText !== undefined) {
+                    ctx.liveOutputText = stripAgyIntermediatePlannerPrefixes(
+                        ctx.liveOutputText,
+                        ctx.agyIntermediatePlannerTexts,
+                    ).text;
+                }
             }
             if (isAgyInternalToolTraceOutput(ctx.fullText)) {
                 console.warn('[jaw:agy] filtered internal tool-planning output without a final answer');

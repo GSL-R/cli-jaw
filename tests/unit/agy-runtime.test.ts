@@ -25,6 +25,7 @@ import {
     shouldCompleteAgyPrintRun,
     shouldFreezeAgyLiveDisplay,
     stripAgyPromptEchoPrefix,
+    stripAgyIntermediatePlannerPrefixes,
     stripAgyResumeReplayPrefix,
     stripAgyResumeReplayPrefixes,
     stripAgyTrailingTimeoutOutput,
@@ -361,6 +362,18 @@ test('AGY-RT-013b: AGY resume strips multi-turn replay before live quiet complet
     assert.match(spawnSrc, /ctx\.outputTextStarted\s*=\s*Boolean\(displayFullText\.trim\(\)\)/);
     assert.match(spawnSrc, /ctx\.agyFinalPlannerSeen && ctx\.agyFinalPlannerText/);
     assert.match(spawnSrc, /ctx\.fullText\s*=\s*ctx\.agyFinalPlannerText/);
+});
+
+test('AGY-RT-013b2: AGY close strips transcript-confirmed intermediate planner prefixes', () => {
+    const planner = 'I will execute the deep work sentinel script for its 09:30 environment check.';
+    assert.deepEqual(
+        stripAgyIntermediatePlannerPrefixes(`${planner}\n선생님, 점검을 마쳤어요.`, [planner]),
+        { text: '선생님, 점검을 마쳤어요.', stripped: true },
+    );
+    assert.deepEqual(
+        stripAgyIntermediatePlannerPrefixes('I will explain the verified result.', [planner]),
+        { text: 'I will explain the verified result.', stripped: false },
+    );
 });
 
 test('AGY-RT-013c: AGY prompt echo strips history/current task prefix from live and final output', () => {

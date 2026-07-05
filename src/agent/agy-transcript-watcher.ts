@@ -54,9 +54,13 @@ function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs:
     let createdAtMs: number | null = null;
     let rowContent = '';
     try {
-        const parsed = JSON.parse(line) as { content?: unknown; created_at?: unknown; type?: unknown };
+        const parsed = JSON.parse(line) as { content?: unknown; created_at?: unknown; type?: unknown; tool_calls?: unknown };
         rowType = typeof parsed.type === 'string' ? parsed.type : '';
         rowContent = typeof parsed.content === 'string' ? parsed.content.trim() : '';
+        if (rowType === 'PLANNER_RESPONSE' && rowContent && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+            const planners = ctx.agyIntermediatePlannerTexts ?? [];
+            if (!planners.includes(rowContent)) ctx.agyIntermediatePlannerTexts = [...planners.slice(-15), rowContent];
+        }
         if (typeof parsed.created_at === 'string') {
             const createdAt = Date.parse(parsed.created_at);
             if (Number.isFinite(createdAt)) {
@@ -72,6 +76,7 @@ function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs:
     if (rowType === 'USER_INPUT' || rowType === 'CHECKPOINT') {
         ctx.agyFinalPlannerSeen = false;
         ctx.agyFinalPlannerText = undefined;
+        ctx.agyIntermediatePlannerTexts = [];
         ctx.agyLastTranscriptError = undefined;
         return;
     }
@@ -184,6 +189,7 @@ export function startAgyTranscriptWatcher(options: {
         options.ctx.agyTranscriptLastReason = 'transcript-selection-reset';
         options.ctx.agyFinalPlannerSeen = false;
         options.ctx.agyFinalPlannerText = undefined;
+        options.ctx.agyIntermediatePlannerTexts = [];
         options.ctx.agyLastTranscriptError = undefined;
     };
 
@@ -220,6 +226,7 @@ export function startAgyTranscriptWatcher(options: {
         options.ctx.agyTranscriptLastReason = 'transcript-selected';
         options.ctx.agyFinalPlannerSeen = false;
         options.ctx.agyFinalPlannerText = undefined;
+        options.ctx.agyIntermediatePlannerTexts = [];
         options.ctx.agyLastTranscriptError = undefined;
         console.log(`[jaw:agy:transcript] tailing ${transcriptPath} (current-turn filter from ${new Date(startedAt).toISOString()})`);
     };

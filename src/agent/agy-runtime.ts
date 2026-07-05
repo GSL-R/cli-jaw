@@ -279,6 +279,21 @@ export function stripAgyPromptEchoPrefix(text: string, prompt: string): { text: 
     return { text: current, stripped: false, replayOnly: false };
 }
 
+export function stripAgyIntermediatePlannerPrefixes(
+    text: string,
+    plannerTexts: readonly string[] | undefined,
+): { text: string; stripped: boolean } {
+    let current = String(text || '');
+    let stripped = false;
+    for (const plannerText of plannerTexts ?? []) {
+        const prefix = String(plannerText || '').trim();
+        if (!prefix || !current.trimStart().startsWith(prefix)) continue;
+        current = current.trimStart().slice(prefix.length).replace(/^\s+/, '');
+        stripped = true;
+    }
+    return { text: current, stripped };
+}
+
 export function hasRunningAgyTranscriptTool(toolLog: Pick<ToolEntry, 'status' | 'stepRef'>[]): boolean {
     return toolLog.some((tool) => {
         if (!tool.stepRef?.startsWith('agy:transcript:')) return false;

@@ -136,6 +136,7 @@ export interface SpawnContext {
   agyBootstrapAcceptanceMode?: AgyBootstrapAcceptanceMode;
   agyFinalPlannerSeen?: boolean;
   agyFinalPlannerText?: string | undefined;
+  agyIntermediatePlannerTexts?: string[];
   agyLastTranscriptError?: AgyTranscriptError | undefined;
   /** Set when agy stdout accumulation hit AGY_FULLTEXT_MAX_CHARS (explicit, not silent). */
   agyFullTextTruncated?: boolean;
