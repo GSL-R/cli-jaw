@@ -430,7 +430,20 @@ async function _initTelegramInner() {
     bot.catch((err) => console.error('[tg:error]', err.message || err));
     bot.use(sequentialize((ctx) => `tg:${ctx.chat?.id || 'unknown'}`));
 
+    const seenUpdateIds = new Set<number>();
+    const updateIdOrder: number[] = [];
     bot.use(async (ctx, next) => {
+        const updateId = ctx.update.update_id;
+        if (seenUpdateIds.has(updateId)) {
+            console.log(`[tg:update] suppressed duplicate update_id=${updateId}`);
+            return;
+        }
+        seenUpdateIds.add(updateId);
+        updateIdOrder.push(updateId);
+        if (updateIdOrder.length > 512) {
+            const expired = updateIdOrder.shift();
+            if (expired !== undefined) seenUpdateIds.delete(expired);
+        }
         console.log(`[tg:update] chat=${ctx.chat?.id} text=${(ctx.message?.text || '').slice(0, 40)}`);
         await next();
     });
@@ -676,7 +689,7 @@ async function _initTelegramInner() {
             }
             return;
         }
-        tgOrchestrate(ctx, text, text);
+        await tgOrchestrate(ctx, text, text);
     });
 
     bot.on('message:photo', async (ctx) => {
