@@ -36,6 +36,7 @@ import {
     telegramRetryAfter,
 } from './delivery-guard.js';
 import { StatusUpdateBuffer } from './status-update-buffer.js';
+import { isTransientTelegramNetworkError, sendTelegramTextWithRetry } from './telegram-text.js';
 import { requiresNativeFetchBody } from './fetch-body.js';
 import {
     escapeHtmlTg,
@@ -614,10 +615,16 @@ async function _initTelegramInner() {
             const chunks = chunkTelegramMessage(html);
             for (const chunk of chunks) {
                 try {
-                    await ctx.reply(chunk, { parse_mode: 'HTML' });
+                    await sendTelegramTextWithRetry(
+                        () => ctx.reply(chunk, { parse_mode: 'HTML' }),
+                        { label: 'tgOrchestrate:html' },
+                    );
                 } catch (err: unknown) {
                     if (!isTelegramParseError(err)) throw err;
-                    await ctx.reply(chunk.replace(/<[^>]+>/g, ''));
+                    await sendTelegramTextWithRetry(
+                        () => ctx.reply(chunk.replace(/<[^>]+>/g, '')),
+                        { label: 'tgOrchestrate:plain' },
+                    );
                 }
             }
             console.log(`[tg:out] ${chat.id}: ${result.slice(0, 80)}`);
@@ -634,6 +641,11 @@ async function _initTelegramInner() {
             console.error('[tg:error]', err);
             if (isTelegramRateLimitError(err)) {
                 console.error(`[tg:cooldown] suppressing recursive error reply (${telegramRetryAfter(err)}s remaining)`);
+                return;
+            }
+            if (isTransientTelegramNetworkError(err)) {
+                await ctx.reply('⚠️ 응답은 생성됐지만 Telegram 전송이 일시적으로 실패했어요. 응답 내용은 Web UI에서 확인할 수 있어요.')
+                    .catch((noticeErr: unknown) => console.error('[tg:delivery-notice]', (noticeErr as Error).message));
                 return;
             }
             await ctx.reply(`❌ Error: ${(err as Error).message}`);
