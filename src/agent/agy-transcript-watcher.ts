@@ -49,7 +49,7 @@ function transcriptMtimeMs(transcriptPath: string): number {
     }
 }
 
-function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs: number): void {
+export function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs: number): void {
     let rowType = '';
     let createdAtMs: number | null = null;
     let rowContent = '';
@@ -100,7 +100,11 @@ function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs:
     } else if (kind === 'tool' || kind === 'planner') {
         ctx.agyFinalPlannerSeen = false;
         ctx.agyFinalPlannerText = undefined;
-        ctx.agyLastTranscriptError = undefined;
+        // Provider errors are terminal evidence unless AGY later produces an
+        // actual final answer. After a quota/capacity error AGY commonly emits
+        // one or more empty PLANNER_RESPONSE rows before exiting successfully;
+        // clearing here turns that failed run into exit 0 and suppresses the
+        // configured cross-provider fallback.
     }
 }
 

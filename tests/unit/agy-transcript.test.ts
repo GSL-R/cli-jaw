@@ -13,6 +13,7 @@ import {
     readTranscriptDelta,
     transcriptContainsPrompt,
 } from '../../src/agent/agy-transcript.ts';
+import { updateFinalPlannerFlag } from '../../src/agent/agy-transcript-watcher.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixturePath = path.join(__dirname, '../fixtures/agy-transcript/sample-lines.jsonl');
@@ -260,6 +261,47 @@ test('AGY-TR-020: malformed ERROR_MESSAGE rows classify safely', () => {
     assert.equal(row.error?.message, 'Antigravity provider error');
     assert.equal(row.error?.code, undefined);
     assert.equal(row.error?.createdAtMs, undefined);
+});
+
+test('AGY-TR-021: empty planner rows cannot erase provider errors before fallback', () => {
+    const ctx = {
+        agyFinalPlannerSeen: false,
+        agyFinalPlannerText: undefined,
+        agyIntermediatePlannerTexts: [],
+        agyLastTranscriptError: undefined,
+    } as any;
+    const startedAt = Date.parse('2026-07-08T16:43:03.000Z');
+
+    updateFinalPlannerFlag(ctx, JSON.stringify({
+        type: 'USER_INPUT',
+        created_at: '2026-07-08T16:43:03.000Z',
+    }), startedAt);
+    updateFinalPlannerFlag(ctx, JSON.stringify({
+        type: 'ERROR_MESSAGE',
+        error: 'The model API is currently overloaded and may experience intermittent errors.',
+        error_code: 429,
+        created_at: '2026-07-08T16:43:09.000Z',
+    }), startedAt);
+    updateFinalPlannerFlag(ctx, JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-07-08T16:43:09.100Z',
+    }), startedAt);
+
+    assert.equal(ctx.agyLastTranscriptError?.code, 429);
+    assert.equal(ctx.agyFinalPlannerSeen, false);
+
+    updateFinalPlannerFlag(ctx, JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '정상 최종 응답',
+        tool_calls: [],
+        created_at: '2026-07-08T16:43:10.000Z',
+    }), startedAt);
+
+    assert.equal(ctx.agyLastTranscriptError, undefined);
+    assert.equal(ctx.agyFinalPlannerSeen, true);
+    assert.equal(ctx.agyFinalPlannerText, '정상 최종 응답');
 });
 
 test('AGY-TR-014: transcriptContainsPrompt matches JSON-escaped multiline prompts', () => {
