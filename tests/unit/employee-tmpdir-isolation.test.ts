@@ -80,6 +80,15 @@ test('TMPISO-007b: optional workspace symlink is non-fatal and keeps tmp cwd iso
     assert.ok(src.includes('spawnCwd = tmpDir'), 'employee cwd isolation must remain in place');
 });
 
+test('TMPISO-007c: AGY prompt spill cwd links back to canonical workspace', () => {
+    const src = readSrc('../../src/agent/spawn.ts');
+    const start = src.indexOf('function prepareAgyPromptWorkspace');
+    assert.ok(start >= 0, 'AGY prompt spill preparation must exist');
+    const block = src.slice(start, src.indexOf('export function spawnAgent', start));
+    assert.ok(block.includes("fs.symlinkSync(workingDir, join(tmpDir, 'workspace'), 'dir')"));
+    assert.ok(block.includes('Non-fatal: the absolute Project root in AGENTS.md remains authoritative.'));
+});
+
 test('TMPISO-008: distribute.ts passes sysPrompt unconditionally (not ternary)', () => {
     const src = readSrc('../../src/orchestrator/distribute.ts');
     // Must NOT have: sysPrompt: canResume ? undefined : sysPrompt

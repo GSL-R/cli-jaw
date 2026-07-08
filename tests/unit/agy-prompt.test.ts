@@ -36,6 +36,9 @@ test('AGY-PROMPT-004: no system prompt leaves the task untouched', () => {
 test('AGY-PROMPT-005: spill stores the full system prompt exactly once', () => {
     const files = buildAgySpillWorkspaceFiles('FULL_SYSTEM', '/project', 'CRITICAL');
     assert.match(files['AGENTS.md'], /FULL_SYSTEM/);
+    assert.match(files['AGENTS.md'], /Project root: \/project/);
+    assert.match(files['AGENTS.md'], /temporary prompt-spill directory/);
+    assert.match(files['AGENTS.md'], /\.\/workspace symlink/);
     assert.doesNotMatch(files['GEMINI.md'], /FULL_SYSTEM/);
     assert.doesNotMatch(files['CLAUDE.md'], /FULL_SYSTEM/);
     assert.doesNotMatch(files['CONTEXT.md'], /FULL_SYSTEM/);

@@ -121,6 +121,7 @@ export function buildAgySpillWorkspaceFiles(
         '---',
         '',
         `Project root: ${workingDir}`,
+        'Runtime cwd may be a temporary prompt-spill directory. For persistent project writes, use the Project root above or the ./workspace symlink when present; do not write durable state into the temporary cwd itself.',
     ].join('\n');
     const providerPointer = [
         '# cli-jaw instruction pointer',

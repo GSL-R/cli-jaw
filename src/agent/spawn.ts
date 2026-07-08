@@ -863,6 +863,11 @@ function prepareAgyPromptWorkspace(systemPrompt: string, currentPrompt: string, 
     for (const [name, content] of Object.entries(files)) {
         fs.writeFileSync(join(tmpDir, name), content);
     }
+    try {
+        fs.symlinkSync(workingDir, join(tmpDir, 'workspace'), 'dir');
+    } catch {
+        // Non-fatal: the absolute Project root in AGENTS.md remains authoritative.
+    }
 
     console.log(`[jaw:${label}] AGY prompt spilled to workspace files → ${tmpDir}`);
     return { cwd: tmpDir, prompt: buildAgySpillArgPrompt(runtimeBootstrap, currentPrompt, AGY_INLINE_PROMPT_BYTE_LIMIT) };
