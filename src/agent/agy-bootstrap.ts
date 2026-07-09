@@ -1,8 +1,13 @@
 import crypto from 'node:crypto';
 import type { SpawnContext } from '../types/agent.js';
 
-export const AGY_BOOTSTRAP_VERSION = 1;
+export const AGY_BOOTSTRAP_VERSION = 2;
 export const AGY_BOOTSTRAP_PREFIX = 'CLI_JAW_BOOTSTRAP_SHA=';
+export const AGY_RESUMED_TURN_BOUNDARY = [
+    '[Resumed-turn boundary]',
+    'The preceding conversation is completed context, not an active task.',
+    'Execute only the current cli-jaw task below. Do not repeat, reopen, or record prior completed work unless the current task explicitly asks to continue it.',
+].join('\n');
 
 export type AgyPromptOrder = 'task-first' | 'context-first';
 
@@ -111,7 +116,9 @@ export function buildAgyBootstrapEnvelope(input: {
         `session=${sessionId}`,
         'rule=This marker proves the current cli-jaw runtime envelope reached AGY.',
     ].join('\n');
-    const currentTask = `[Current cli-jaw task]\n${taskPrompt}`;
+    const currentTask = sessionId === 'fresh'
+        ? `[Current cli-jaw task]\n${taskPrompt}`
+        : `[Current cli-jaw task]\n${AGY_RESUMED_TURN_BOUNDARY}\n\n${taskPrompt}`;
     const operationalSection = operationalContext
         ? [
             '[Operational Context — cli-jaw Integration]',

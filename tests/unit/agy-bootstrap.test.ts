@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     AGY_BOOTSTRAP_PREFIX,
+    AGY_RESUMED_TURN_BOUNDARY,
     buildAgyBootstrapEnvelope,
     applyAgyBootstrapAcceptanceFromTranscriptLine,
     transcriptContainsBootstrapSentinel,
@@ -94,6 +95,23 @@ test('AGY-BS-003: AGY bootstrap hash changes when session id changes', () => {
     const first = buildAgyBootstrapEnvelope({ ...base, sessionId: 'session-a' });
     const second = buildAgyBootstrapEnvelope({ ...base, sessionId: 'session-b' });
     assert.notEqual(first.hash, second.hash);
+});
+
+test('AGY-BS-003a: resumed AGY turns explicitly close prior work before the current task', () => {
+    const resumed = buildAgyBootstrapEnvelope({
+        taskPrompt: 'Answer the new baseball question only.',
+        workingDir: '/repo',
+        sessionId: 'session-a',
+    });
+    const fresh = buildAgyBootstrapEnvelope({
+        taskPrompt: 'Answer the new baseball question only.',
+        workingDir: '/repo',
+        sessionId: null,
+    });
+
+    assert.match(resumed.prompt, new RegExp(AGY_RESUMED_TURN_BOUNDARY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.ok(resumed.prompt.indexOf(AGY_RESUMED_TURN_BOUNDARY) < resumed.prompt.indexOf('Answer the new baseball question only.'));
+    assert.doesNotMatch(fresh.prompt, /\[Resumed-turn boundary\]/);
 });
 
 test('AGY-BS-003b: no maxChars preserves sections and reports all present segments', () => {
