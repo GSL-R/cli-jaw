@@ -1,13 +1,14 @@
 // ─── Telegram Bot ────────────────────────────────────
 
 import https from 'node:https';
-import nodeFetch from 'node-fetch';
+import nodeFetch, { type RequestInit } from 'node-fetch';
 import { Bot, type Context } from 'grammy';
 import { sequentialize } from '@grammyjs/runner';
 import { addBroadcastListener, removeBroadcastListener } from '../core/bus.js';
 import { settings } from '../core/config.js';
 import { stripUndefined } from '../core/strip-undefined.js';
 import { resolveHubCallback } from './hub-callback.js';
+import { StatusUpdateBuffer } from './status-update-buffer.js';
 import { t, normalizeLocale } from '../core/i18n.js';
 import { isResetIntent } from '../orchestrator/pipeline.js';
 import { submitMessage } from '../orchestrator/gateway.js';
@@ -30,21 +31,18 @@ import type { RemoteTarget } from '../messaging/types.js';
 import type { ChannelSendRequest } from '../messaging/send.js';
 import {
     installTelegramDeliveryGuard,
-    isTelegramParseError,
     isTelegramRateLimitError,
     telegramErrorCode,
     telegramRetryAfter,
 } from './delivery-guard.js';
-import { StatusUpdateBuffer } from './status-update-buffer.js';
-import { isTransientTelegramNetworkError, sendTelegramTextWithRetry } from './telegram-text.js';
-import { requiresNativeFetchBody } from './fetch-body.js';
+import { isTransientTelegramNetworkError } from './telegram-text.js';
+import { requiresStreamingFetchBody } from './fetch-body.js';
 import {
     escapeHtmlTg,
-    markdownToTelegramHtml,
-    chunkTelegramMessage,
     createForwarderLifecycle,
     createTelegramForwarder,
 } from './forwarder.js';
+import { sendTelegramMarkdown, type RichSendOpts } from './rich-message.js';
 
 export {
     escapeHtmlTg,
@@ -55,8 +53,14 @@ export {
 } from './forwarder.js';
 
 // Re-exported from collect.ts (extracted in Phase B)
-import { orchestrateAndCollect } from '../orchestrator/collect.js';
+import { orchestrateAndCollect, orchestrateAndCollectData } from '../orchestrator/collect.js';
+import { log } from '../core/logger.js';
 export { orchestrateAndCollect };
+import {
+    startPendingElicitation,
+    handleElicitationCallback,
+    discardPendingElicitation,
+} from './elicitation-buttons.js';
 
 // ─── State ───────────────────────────────────────────
 
@@ -79,7 +83,7 @@ const telegramForwarderLifecycle = createForwarderLifecycle({
         },
         shouldSkip: (data: Record<string, unknown>) => data["origin"] === 'telegram', // handled by tgOrchestrate already
         log: ({ chatId, preview }: { chatId: string | number; preview: string }) => {
-            console.log(`[tg:forward] → chat ${chatId}: ${String(preview).slice(0, 60)}...`);
+            log.info(`[tg:forward] → chat ${chatId}: ${String(preview).slice(0, 60)}...`);
         },
     }),
 });
@@ -129,9 +133,21 @@ function installTelegramTargetReplyForwarder(): void {
             text: String(data["text"]),
             target,
         }).then((result) => {
-            if (!result.ok) console.error('[tg:target-reply]', result.error || 'send failed');
+            if (!result.ok) log.error('[tg:target-reply]', result.error || 'send failed');
+            // Forward elicitation keyboards through hub if present.
+            const specs = data["elicitationSpecs"];
+            const raw = Array.isArray(specs) ? specs[0] : undefined;
+            if (typeof raw === 'string' && raw) {
+                const keyboards = startPendingElicitation(String(target.targetId || ''), raw);
+                for (const kb of keyboards ?? []) {
+                    void sendChannelOutput({
+                        channel: 'telegram', type: 'keyboard',
+                        text: kb.text, reply_markup: kb.reply_markup, target,
+                    }).catch(() => {});
+                }
+            }
         }).catch((err: unknown) => {
-            console.error('[tg:target-reply]', (err as Error).message);
+            log.error('[tg:target-reply]', (err as Error).message);
         });
     });
 }
@@ -145,7 +161,7 @@ export async function shutdownTelegram() {
     const old = telegramBot;
     telegramBot = null;
     try { await old.stop(); } catch (e: unknown) {
-        console.warn('[telegram:stop]', (e as Error).message);
+        log.warn('[telegram:stop]', (e as Error).message);
     }
 }
 
@@ -224,7 +240,7 @@ async function telegramSendHandler(req: ChannelSendRequest): Promise<{ ok: boole
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify(stripUndefined({
                     chatId: req.target.targetId, threadId: req.target.threadId,
-                    type: req.type, text: req.text, filePath: req.filePath, caption: req.caption,
+                    type: req.type, text: req.text, filePath: req.filePath, caption: req.caption, reply_markup: req.reply_markup,
                 })),
                 signal: AbortSignal.timeout(15_000),
             });
@@ -253,34 +269,29 @@ async function telegramSendHandler(req: ChannelSendRequest): Promise<{ ok: boole
     if (req.type === 'text') {
         const text = req.text?.trim();
         if (!text) return { ok: false, error: 'text required' };
-        const { markdownToTelegramHtml, chunkTelegramMessage } = await import('./forwarder.js');
-        const html = markdownToTelegramHtml(text);
-        const chunks = chunkTelegramMessage(html);
-        for (const chunk of chunks) {
-            try {
-                await bot.api.sendMessage(chatId, chunk, stripUndefined({ parse_mode: 'HTML', message_thread_id: messageThreadId }));
-            } catch (err: unknown) {
-                if (!isTelegramParseError(err)) {
-                    return stripUndefined({
-                        ok: false,
-                        error: (err as Error).message || 'Telegram send failed',
-                        statusCode: telegramErrorCode(err) || 502,
-                        retryAfter: telegramRetryAfter(err) || undefined,
-                    });
-                }
-                try {
-                    await bot.api.sendMessage(chatId, chunk.replace(/<[^>]+>/g, ''), stripUndefined({ message_thread_id: messageThreadId }));
-                } catch (fallbackErr: unknown) {
-                    return stripUndefined({
-                        ok: false,
-                        error: (fallbackErr as Error).message || 'Telegram fallback send failed',
-                        statusCode: telegramErrorCode(fallbackErr) || 502,
-                        retryAfter: telegramRetryAfter(fallbackErr) || undefined,
-                    });
-                }
-            }
+        // Rich-first default (Bot API 10.1): raw markdown via sendRichMessage, with the
+        // legacy HTML→plaintext chain as per-chunk fallback inside the helper.
+        try {
+            await sendTelegramMarkdown(bot.api, chatId, text, stripUndefined({ message_thread_id: messageThreadId }));
+        } catch (err: unknown) {
+            return stripUndefined({
+                ok: false,
+                error: (err as Error).message || 'Telegram send failed',
+                statusCode: telegramErrorCode(err) || 502,
+                retryAfter: telegramRetryAfter(err) || undefined,
+            });
         }
         return { ok: true, chat_id: chatId, type: 'text' };
+    }
+
+    if (req.type === 'keyboard') {
+        const text = req.text?.trim();
+        if (!text || !req.reply_markup) return { ok: false, error: 'text and reply_markup required for keyboard type' };
+        await bot.api.sendMessage(chatId, text, stripUndefined({
+            message_thread_id: messageThreadId,
+            reply_markup: req.reply_markup as import("@grammyjs/types").InlineKeyboardMarkup,
+        }));
+        return { ok: true, chat_id: chatId, type: 'keyboard' };
     }
 
     // File types
@@ -348,7 +359,7 @@ function makeTelegramCommandCtx() {
 
 export async function initTelegram() {
     if (tgInitLock) {
-        console.warn('[tg] initTelegram already in progress, skipping');
+        log.warn('[tg] initTelegram already in progress, skipping');
         return;
     }
     tgInitLock = true;
@@ -366,7 +377,7 @@ async function _initTelegramInner() {
         try {
             await old.stop();
         } catch (e: unknown) {
-            console.warn('[telegram:stop]', (e as Error).message);
+            log.warn('[telegram:stop]', (e as Error).message);
             await new Promise(r => setTimeout(r, 2000));
         }
     }
@@ -382,21 +393,24 @@ async function _initTelegramInner() {
     }
 
     if (!settings["telegram"]?.enabled || !settings["telegram"]?.token) {
-        console.log('[tg] ⏭️  Telegram pending (disabled or no token)');
+        log.info('[tg] ⏭️  Telegram pending (disabled or no token)');
         return;
     }
 
     // Pre-seed telegramActiveChatIds from persisted allowedChatIds
     if (settings["telegram"].allowedChatIds?.length) {
         for (const id of settings["telegram"].allowedChatIds) telegramActiveChatIds.add(id);
-        console.log(`[tg] Pre-seeded ${settings["telegram"].allowedChatIds.length} chat(s) from allowedChatIds`);
+        log.info(`[tg] Pre-seeded ${settings["telegram"].allowedChatIds.length} chat(s) from allowedChatIds`);
     }
 
     const ipv4Agent = new https.Agent({ family: 4 });
     const ipv4Fetch = (url: string, init: Record<string, unknown> = {}): Promise<unknown> => {
         const body = init["body"];
-        if (requiresNativeFetchBody(body)) {
-            return nodeFetch(url, { ...init, agent: ipv4Agent } as any) as Promise<unknown>;
+        if (requiresStreamingFetchBody(body)) {
+            return nodeFetch(url, {
+                ...(init as RequestInit),
+                agent: ipv4Agent,
+            });
         }
         return new Promise((resolve, reject) => {
             const u = new URL(url);
@@ -428,7 +442,7 @@ async function _initTelegramInner() {
         client: { fetch: ipv4Fetch as never },
     });
     installTelegramDeliveryGuard(bot, settings["telegram"].token);
-    bot.catch((err) => console.error('[tg:error]', err.message || err));
+    bot.catch((err) => log.error('[tg:error]', err.message || err));
     bot.use(sequentialize((ctx) => `tg:${ctx.chat?.id || 'unknown'}`));
 
     const seenUpdateIds = new Set<number>();
@@ -436,7 +450,7 @@ async function _initTelegramInner() {
     bot.use(async (ctx, next) => {
         const updateId = ctx.update.update_id;
         if (seenUpdateIds.has(updateId)) {
-            console.log(`[tg:update] suppressed duplicate update_id=${updateId}`);
+            log.info(`[tg:update] suppressed duplicate update_id=${updateId}`);
             return;
         }
         seenUpdateIds.add(updateId);
@@ -445,14 +459,14 @@ async function _initTelegramInner() {
             const expired = updateIdOrder.shift();
             if (expired !== undefined) seenUpdateIds.delete(expired);
         }
-        console.log(`[tg:update] chat=${ctx.chat?.id} text=${(ctx.message?.text || '').slice(0, 40)}`);
+        log.info(`[tg:update] chat=${ctx.chat?.id} text=${(ctx.message?.text || '').slice(0, 40)}`);
         await next();
     });
 
     bot.use(async (ctx, next) => {
         const allowed = settings["telegram"].allowedChatIds;
         if (allowed?.length > 0 && !allowed.includes(ctx.chat?.id)) {
-            console.log(`[tg:blocked] chatId=${ctx.chat?.id}`);
+            log.info(`[tg:blocked] chatId=${ctx.chat?.id}`);
             return;
         }
         await next();
@@ -477,14 +491,49 @@ async function _initTelegramInner() {
     bot.command('start', (ctx) => ctx.reply(t('tg.connected', {}, currentLocale())));
     bot.command('id', (ctx) => ctx.reply(`Chat ID: <code>${ctx.chat?.id ?? ''}</code>`, { parse_mode: 'HTML' }));
 
+    // Inline-keyboard elicitation answers (single_select fences → buttons).
+    bot.callbackQuery(/^elic:/, async (ctx) => {
+        const cbChatId = ctx.chat?.id;
+        if (!cbChatId) { await ctx.answerCallbackQuery().catch(() => { }); return; }
+        const result = handleElicitationCallback(String(cbChatId), ctx.callbackQuery.data ?? '');
+        if (result.kind === 'stale') {
+            await ctx.answerCallbackQuery({ text: t('tg.elicitationExpired', {}, currentLocale()) }).catch(() => { });
+            return;
+        }
+        await ctx.answerCallbackQuery({ text: result.ack }).catch(() => { });
+        // Best-effort: freeze the tapped question's keyboard so the choice reads as taken.
+        await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => { });
+        if (result.kind === 'complete') {
+            await tgOrchestrate(ctx, result.combinedAnswer, result.combinedAnswer);
+        }
+    });
+
     async function tgOrchestrate(ctx: Context, prompt: string, displayMsg: string) {
         const chatId = ctx.chat?.id;
         if (!ctx.chat) return;
         const chat = ctx.chat;
         const result = submitMessage(prompt, stripUndefined({ origin: 'telegram' as const, displayText: displayMsg, skipOrchestrate: true, chatId }));
+        // Reproduce grammy ctx.reply's auto-injected routing (context.js: thread/business/DM-topic)
+        // so the rich-first send helper lands replies exactly where ctx.reply would.
+        const replyOptsOf = (c: Context): RichSendOpts => stripUndefined({
+            business_connection_id: c.businessConnectionId,
+            message_thread_id: c.msg?.is_topic_message ? c.msg.message_thread_id : undefined,
+            direct_messages_topic_id: c.msg?.direct_messages_topic?.topic_id,
+        });
+        // Single_select elicitation fences arrive as raw specs on orchestrate_done;
+        // render the first one as inline-keyboard messages after the text body.
+        const sendElicitationKeyboards = async (targetChatId: number | string, specs: unknown) => {
+            const raw = Array.isArray(specs) ? specs[0] : undefined;
+            if (typeof raw !== 'string' || !raw) return;
+            const keyboards = startPendingElicitation(String(targetChatId), raw);
+            for (const kb of keyboards ?? []) {
+                await ctx.api.sendMessage(targetChatId, kb.text, { ...replyOptsOf(ctx), reply_markup: kb.reply_markup })
+                    .catch(() => { });
+            }
+        };
 
         if (result.action === 'queued') {
-            console.log(`[tg:queue] agent busy, queued (${result.pending} pending)`);
+            log.info(`[tg:queue] agent busy, queued (${result.pending} pending)`);
             await ctx.reply(t('tg.queued', { count: result.pending }, currentLocale()));
 
             // 큐 처리 후 응답을 이 채팅으로 전달 — requestId로 request-level 격리
@@ -492,12 +541,9 @@ async function _initTelegramInner() {
             const queueHandler = (type: string, data: Record<string, unknown>) => {
                 if (type === 'orchestrate_done' && data["text"] && data["origin"] === 'telegram' && data["requestId"] === requestId) {
                     removeBroadcastListener(queueHandler);
-                    const html = markdownToTelegramHtml(String(data["text"]));
-                    const chunks = chunkTelegramMessage(html);
-                    for (const chunk of chunks) {
-                        ctx.reply(chunk, { parse_mode: 'HTML' })
-                            .catch(() => ctx.reply(chunk.replace(/<[^>]+>/g, '')).catch(() => { }));
-                    }
+                    sendTelegramMarkdown(ctx.api, chat.id, String(data["text"]), replyOptsOf(ctx))
+                        .then(() => sendElicitationKeyboards(chat.id, data["elicitationSpecs"]))
+                        .catch(() => { });
                 }
             };
             addBroadcastListener(queueHandler);
@@ -515,12 +561,12 @@ async function _initTelegramInner() {
         markChatActive(chat.id, ctx);
 
         await ctx.replyWithChatAction('typing')
-            .then(() => console.log('[tg:typing] ✅ sent'))
-            .catch((e: unknown) => console.log('[tg:typing] ❌', (e as Error).message));
+            .then(() => log.info('[tg:typing] ✅ sent'))
+            .catch((e: unknown) => log.info('[tg:typing] ❌', (e as Error).message));
         const typingInterval = setInterval(() => {
             ctx.replyWithChatAction('typing')
-                .then(() => console.log('[tg:typing] ✅ refresh'))
-                .catch((e: unknown) => console.log('[tg:typing] ❌ refresh', (e as Error).message));
+                .then(() => log.info('[tg:typing] ✅ refresh'))
+                .catch((e: unknown) => log.info('[tg:typing] ❌ refresh', (e as Error).message));
         }, 4000);
 
         const showTools = settings["telegram"]?.showToolUse !== false;
@@ -588,7 +634,7 @@ async function _initTelegramInner() {
             } else if (type === 'agent_fallback') {
                 pushToolLine(`⚡ ${data["from"]} → ${data["to"]}`);
             } else if (type === 'agent_smoke') {
-                console.log(`[tg:smoke] ${data["cli"]} smoke detected — auto-continuing`);
+                log.info(`[tg:smoke] ${data["cli"]} smoke detected — auto-continuing`);
             } else if (type === 'agent_tool' && data["icon"] && data["label"]) {
                 // Copilot ACP emits many thought chunks; hide them on Telegram to avoid message storms.
                 if (data["icon"] === '💭') return;
@@ -601,7 +647,7 @@ async function _initTelegramInner() {
         if (toolHandler) addBroadcastListener(toolHandler);
 
         try {
-            const result = await orchestrateAndCollect(prompt, { origin: 'telegram', chatId: chat.id, requestId: submitRequestId, _skipInsert: true }) as string;
+            const { text: result, data: doneData } = await orchestrateAndCollectData(prompt, { origin: 'telegram', chatId: chat.id, requestId: submitRequestId, _skipInsert: true });
             clearInterval(typingInterval);
             if (statusUpdateTimer) {
                 clearTimeout(statusUpdateTimer);
@@ -611,23 +657,9 @@ async function _initTelegramInner() {
             if (statusMsgId) {
                 ctx.api.deleteMessage(chat.id, statusMsgId).catch(() => { });
             }
-            const html = markdownToTelegramHtml(result);
-            const chunks = chunkTelegramMessage(html);
-            for (const chunk of chunks) {
-                try {
-                    await sendTelegramTextWithRetry(
-                        () => ctx.reply(chunk, { parse_mode: 'HTML' }),
-                        { label: 'tgOrchestrate:html' },
-                    );
-                } catch (err: unknown) {
-                    if (!isTelegramParseError(err)) throw err;
-                    await sendTelegramTextWithRetry(
-                        () => ctx.reply(chunk.replace(/<[^>]+>/g, '')),
-                        { label: 'tgOrchestrate:plain' },
-                    );
-                }
-            }
-            console.log(`[tg:out] ${chat.id}: ${result.slice(0, 80)}`);
+            await sendTelegramMarkdown(ctx.api, chat.id, result, replyOptsOf(ctx));
+            await sendElicitationKeyboards(chat.id, doneData["elicitationSpecs"]);
+            log.info(`[tg:out] ${chat.id}: ${result.slice(0, 80)}`);
         } catch (err: unknown) {
             clearInterval(typingInterval);
             if (statusUpdateTimer) {
@@ -638,14 +670,14 @@ async function _initTelegramInner() {
             if (statusMsgId) {
                 ctx.api.deleteMessage(chat.id, statusMsgId).catch(() => { });
             }
-            console.error('[tg:error]', err);
+            log.error('[tg:error]', err);
             if (isTelegramRateLimitError(err)) {
-                console.error(`[tg:cooldown] suppressing recursive error reply (${telegramRetryAfter(err)}s remaining)`);
+                log.error(`[tg:cooldown] suppressing recursive error reply (${telegramRetryAfter(err)}s remaining)`);
                 return;
             }
             if (isTransientTelegramNetworkError(err)) {
                 await ctx.reply('⚠️ 응답은 생성됐지만 Telegram 전송이 일시적으로 실패했어요. 응답 내용은 Web UI에서 확인할 수 있어요.')
-                    .catch((noticeErr: unknown) => console.error('[tg:delivery-notice]', (noticeErr as Error).message));
+                    .catch((noticeErr: unknown) => log.error('[tg:delivery-notice]', (noticeErr as Error).message));
                 return;
             }
             await ctx.reply(`❌ Error: ${(err as Error).message}`);
@@ -673,7 +705,7 @@ async function _initTelegramInner() {
                 try {
                     await tgOrchestrate(ctx, steerPrompt, steerPrompt);
                 } catch (err: unknown) {
-                    console.error('[tg:steer]', (err as Error).message);
+                    log.error('[tg:steer]', (err as Error).message);
                     await ctx.reply(`❌ Steer failed: ${(err as Error).message}`.slice(0, 500)).catch(() => {});
                 }
                 return;
@@ -689,7 +721,11 @@ async function _initTelegramInner() {
             }
             return;
         }
-        console.log(`[tg:in] ${ctx.chat?.id}: ${text.slice(0, 80)}`);
+        log.info(`[tg:in] ${ctx.chat?.id}: ${text.slice(0, 80)}`);
+
+        // Typed reply supersedes any pending elicitation buttons (placed after the
+        // /command branch so slash commands do not discard the pending session).
+        discardPendingElicitation(String(ctx.chat.id));
 
         // Reset intent: use submitMessage gateway for consistency
         if (isResetIntent(text)) {
@@ -708,7 +744,7 @@ async function _initTelegramInner() {
         const photos = ctx.message.photo;
         const largest = photos[photos.length - 1]!;
         const caption = ctx.message.caption || '';
-        console.log(`[tg:photo] ${ctx.chat?.id}: fileId=${largest.file_id.slice(0, 20)}... caption=${caption.slice(0, 40)}`);
+        log.info(`[tg:photo] ${ctx.chat?.id}: fileId=${largest.file_id.slice(0, 20)}... caption=${caption.slice(0, 40)}`);
         try {
             const dlResult = await downloadTelegramFile(largest.file_id, settings["telegram"].token, stripUndefined({
                 kind: 'photo',
@@ -719,7 +755,7 @@ async function _initTelegramInner() {
             const prompt = buildMediaPrompt(filePath, caption);
             tgOrchestrate(ctx, prompt, `${t('tg.imageCaption', { caption }, currentLocale())}`);
         } catch (err: unknown) {
-            console.error('[tg:photo:error]', err);
+            log.error('[tg:photo:error]', err);
             await ctx.reply(t('tg.imageFail', { msg: (err as Error).message }, currentLocale()));
         }
     });
@@ -727,7 +763,7 @@ async function _initTelegramInner() {
     bot.on('message:document', async (ctx) => {
         const doc = ctx.message.document;
         const caption = ctx.message.caption || '';
-        console.log(`[tg:doc] ${ctx.chat?.id}: ${doc.file_name} (${doc.file_size} bytes)`);
+        log.info(`[tg:doc] ${ctx.chat?.id}: ${doc.file_name} (${doc.file_size} bytes)`);
         try {
             const dlResult = await downloadTelegramFile(doc.file_id, settings["telegram"].token, stripUndefined({
                 kind: 'document',
@@ -738,7 +774,7 @@ async function _initTelegramInner() {
             const prompt = buildMediaPrompt(filePath, caption);
             tgOrchestrate(ctx, prompt, `[📎 ${doc.file_name || 'file'}] ${caption}`);
         } catch (err: unknown) {
-            console.error('[tg:doc:error]', err);
+            log.error('[tg:doc:error]', err);
             await ctx.reply(t('tg.fileFail', { msg: (err as Error).message }, currentLocale()));
         }
     });
@@ -751,7 +787,7 @@ async function _initTelegramInner() {
     }
 
     void syncTelegramCommands(bot).catch((e) => {
-        console.warn('[tg:commands] setMyCommands failed:', e.message);
+        log.warn('[tg:commands] setMyCommands failed:', e.message);
     });
 
     botUsername = null;
@@ -768,25 +804,25 @@ async function _initTelegramInner() {
         drop_pending_updates: true,
         onStart: (info) => {
             tg409RetryCount = 0;
-            console.log(`[tg] ✅ @${info.username} polling active`);
+            log.info(`[tg] ✅ @${info.username} polling active`);
         },
     }).catch((err) => {
         const is409 = err?.error_code === 409 || err?.message?.includes('409');
         if (is409) {
             tg409RetryCount++;
             if (tg409RetryCount > TG_MAX_RETRIES) {
-                console.error(`[tg:409] Max retries (${TG_MAX_RETRIES}) exceeded. Restart server to retry.`);
+                log.error(`[tg:409] Max retries (${TG_MAX_RETRIES}) exceeded. Restart server to retry.`);
                 return;
             }
             const delay = Math.min(5000 * Math.pow(2, tg409RetryCount - 1), 30000);
-            console.warn(`[tg:409] Polling conflict — retry ${tg409RetryCount}/${TG_MAX_RETRIES} in ${delay / 1000}s...`);
+            log.warn(`[tg:409] Polling conflict — retry ${tg409RetryCount}/${TG_MAX_RETRIES} in ${delay / 1000}s...`);
             if (!tgRetryTimer) {
                 tgRetryTimer = setTimeout(() => { tgRetryTimer = null; void initTelegram(); }, delay);
             }
         } else {
-            console.error('[tg:fatal]', err);
+            log.error('[tg:fatal]', err);
         }
     });
     telegramBot = bot;
-    console.log('[tg] Bot starting...');
+    log.info('[tg] Bot starting...');
 }

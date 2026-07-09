@@ -1,4 +1,4 @@
-export function requiresNativeFetchBody(body: unknown): boolean {
+export function requiresStreamingFetchBody(body: unknown): boolean {
     if (!body || typeof body !== 'object') return false;
     if (body instanceof FormData || body instanceof Blob) return true;
     // grammY multipart uploads are Node streams. Duck-typing keeps custom

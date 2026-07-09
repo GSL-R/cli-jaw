@@ -18,6 +18,7 @@ export type ChannelSendRequest = {
     caption?: string;
     target?: RemoteTarget;
     chatId?: string | number;
+    reply_markup?: unknown;
 };
 
 // ─── Transport Send Registry ────────────────────────
@@ -25,7 +26,7 @@ export type ChannelSendRequest = {
 type TransportSendFn = (req: ChannelSendRequest) => Promise<{ ok: boolean; error?: string; [k: string]: unknown }>;
 
 const sendFns = new Map<MessengerChannel, TransportSendFn>();
-const OUTBOUND_TYPES = new Set<OutboundType>(['text', 'voice', 'photo', 'document']);
+const OUTBOUND_TYPES = new Set<OutboundType>(['text', 'voice', 'photo', 'document', 'keyboard']);
 const CHANNELS = new Set<MessengerChannel | 'active'>(['telegram', 'discord', 'active']);
 
 export function registerSendTransport(channel: MessengerChannel, fn: TransportSendFn) {

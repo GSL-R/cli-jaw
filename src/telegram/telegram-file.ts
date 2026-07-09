@@ -1,6 +1,7 @@
 import { InputFile, type Bot } from 'grammy';
 import fs from 'node:fs';
 import { stripUndefined } from '../core/strip-undefined.js';
+import { log } from '../core/logger.js';
 
 interface TelegramApiErrorLike {
     error_code?: number;
@@ -26,6 +27,7 @@ export const TELEGRAM_LIMITS: Record<string, number> = {
 
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
+const MAX_DELAY_MS = 30_000;       // single retry delay cap
 const MAX_TOTAL_WAIT_MS = 60_000;  // cumulative wait cap
 
 /**
@@ -58,6 +60,10 @@ function isTransient(err: unknown): boolean {
     const code = e.code || '';
     if (/ETIMEDOUT|ECONNRESET|ECONNREFUSED|EPIPE/.test(code)) return true;
     return false;
+}
+
+function getRetryAfterMs(err: unknown): number {
+    return (asTgErr(err).parameters?.retry_after ?? 0) * 1000;
 }
 
 /** Determine upstream error category for HTTP response code. */
@@ -116,7 +122,7 @@ export async function sendTelegramFile(
             if (!transient || attempt === MAX_RETRIES) {
                 const sc = transient ? classifyUpstreamError(err) : (e.error_code || e.statusCode || 500);
                 const cause = e.error;
-                console.error(
+                log.error(
                     `[telegram:file] failed after ${attempt} attempt(s):`,
                     e.message,
                     `cause=${cause?.constructor?.name || cause?.type || 'unknown'}`,
@@ -130,10 +136,22 @@ export async function sendTelegramFile(
                 });
             }
 
-            const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+            const retryAfterMs = getRetryAfterMs(err);
+            // If upstream demands more than MAX_DELAY_MS, bail immediately
+            if (retryAfterMs > MAX_DELAY_MS) {
+                log.error(`[telegram:file] retry_after ${retryAfterMs}ms exceeds cap, giving up`);
+                return stripUndefined({
+                    ok: false, attempts: attempt,
+                    error: `retry_after too large: ${retryAfterMs}ms`,
+                    retryAfter: e.parameters?.retry_after,
+                    statusCode: 429,
+                });
+            }
+
+            const delay = Math.max(retryAfterMs, BASE_DELAY_MS * Math.pow(2, attempt - 1));
             totalWaited += delay;
             if (totalWaited >= MAX_TOTAL_WAIT_MS) {
-                console.error(`[telegram:file] total wait ${totalWaited}ms exceeds cap, giving up`);
+                log.error(`[telegram:file] total wait ${totalWaited}ms exceeds cap, giving up`);
                 return {
                     ok: false, attempts: attempt,
                     error: `total retry wait exceeded ${MAX_TOTAL_WAIT_MS}ms`,
@@ -141,7 +159,7 @@ export async function sendTelegramFile(
                 };
             }
 
-            console.warn(`[telegram:retry] attempt ${attempt}/${MAX_RETRIES} failed (${e.error_code || 'network'}), retrying in ${delay}ms...`);
+            log.warn(`[telegram:retry] attempt ${attempt}/${MAX_RETRIES} failed (${e.error_code || 'network'}), retrying in ${delay}ms...`);
             await new Promise(r => setTimeout(r, delay));
         }
     }

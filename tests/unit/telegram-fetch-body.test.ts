@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { requiresNativeFetchBody } from '../../src/telegram/fetch-body.js';
+import { requiresStreamingFetchBody } from '../../src/telegram/fetch-body.js';
 
 test('multipart and streaming bodies bypass the JSON-only IPv4 adapter', () => {
     class MultipartReadable extends Readable {
@@ -11,16 +11,16 @@ test('multipart and streaming bodies bypass the JSON-only IPv4 adapter', () => {
         }
     }
 
-    assert.equal(requiresNativeFetchBody(new FormData()), true);
-    assert.equal(requiresNativeFetchBody(new Blob(['image'])), true);
-    assert.equal(requiresNativeFetchBody(Readable.from(['image'])), true);
-    assert.equal(requiresNativeFetchBody(new MultipartReadable()), true);
-    assert.equal(requiresNativeFetchBody({ pipe() {} }), true);
-    assert.equal(requiresNativeFetchBody(new ReadableStream()), false);
+    assert.equal(requiresStreamingFetchBody(new FormData()), true);
+    assert.equal(requiresStreamingFetchBody(new Blob(['image'])), true);
+    assert.equal(requiresStreamingFetchBody(Readable.from(['image'])), true);
+    assert.equal(requiresStreamingFetchBody(new MultipartReadable()), true);
+    assert.equal(requiresStreamingFetchBody({ pipe() {} }), true);
+    assert.equal(requiresStreamingFetchBody(new ReadableStream()), false);
 });
 
 test('plain JSON-compatible bodies keep using the IPv4 adapter', () => {
-    assert.equal(requiresNativeFetchBody({ message: 'hello' }), false);
-    assert.equal(requiresNativeFetchBody('text'), false);
-    assert.equal(requiresNativeFetchBody(null), false);
+    assert.equal(requiresStreamingFetchBody({ message: 'hello' }), false);
+    assert.equal(requiresStreamingFetchBody('text'), false);
+    assert.equal(requiresStreamingFetchBody(null), false);
 });

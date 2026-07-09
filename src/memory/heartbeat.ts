@@ -23,6 +23,7 @@ import { sendChannelOutput } from '../messaging/send.js';
 import { insertHeartbeatAnchor } from '../core/db.js';
 import { getState } from '../orchestrator/state-machine.js';
 import { getGoalContinuationPrompt } from '../goal/heartbeat.js';
+import { log } from '../core/logger.js';
 import {
     describeHeartbeatSchedule,
     formatHeartbeatNow,
@@ -198,7 +199,7 @@ export function startHeartbeat() {
         if (schedule.kind === 'cron') {
             const cronError = validateHeartbeatCron(schedule.cron);
             if (cronError) {
-                console.warn(`[heartbeat:${job.name}] invalid cron "${schedule.cron}": ${cronError}`);
+                log.warn(`[heartbeat:${job.name}] invalid cron "${schedule.cron}": ${cronError}`);
                 continue;
             }
             scheduleCronJob(job);
@@ -210,7 +211,7 @@ export function startHeartbeat() {
         heartbeatTimers.set(job.id, timer);
     }
     const n = heartbeatTimers.size;
-    console.log(`[heartbeat] ${n} job${n !== 1 ? 's' : ''} active`);
+    log.info(`[heartbeat] ${n} job${n !== 1 ? 's' : ''} active`);
 }
 
 export function stopHeartbeat() {
@@ -222,20 +223,20 @@ export function stopHeartbeat() {
 async function runHeartbeatJob(job: Record<string, any>) {
     if (getState('default') !== 'IDLE') {
         const queued = queueHeartbeatJob(job, 'pabcd_active', 'defer');
-        console.log(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active PABCD (${pendingJobs.length} pending)`);
+        log.info(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active PABCD (${pendingJobs.length} pending)`);
         return;
     }
     if (heartbeatBusy) {
         if (queueHeartbeatJob(job, 'busy')) {
-            console.log(`[heartbeat:${job["name"]}] queued (${pendingJobs.length} pending)`);
+            log.info(`[heartbeat:${job["name"]}] queued (${pendingJobs.length} pending)`);
         } else {
-            console.log(`[heartbeat:${job["name"]}] already queued, skip`);
+            log.info(`[heartbeat:${job["name"]}] already queued, skip`);
         }
         return;
     }
     if (isAgentBusy()) {
         const queued = queueHeartbeatJob(job, 'agent_busy', 'defer');
-        console.log(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active main agent (${pendingJobs.length} pending)`);
+        log.info(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active main agent (${pendingJobs.length} pending)`);
         return;
     }
     heartbeatBusy = true;
@@ -246,7 +247,7 @@ async function runHeartbeatJob(job: Record<string, any>) {
         const goalPrompt = getGoalContinuationPrompt();
         const goalSection = goalPrompt ? `\n\n--- Active Goal ---\n${goalPrompt}\n--- End Goal ---\n` : '';
         const prompt = `[heartbeat:${job["name"]}] 현재 시간: ${now} (${timeZone})\n\nHeartbeat task rule: run the job's explicit script or narrow task first. Do not perform startup self-audit, provider config inspection, broad file search, or memory search unless the job itself needs historical context and no canonical tool/path is available.${goalSection}\n\n${job["prompt"] || '정기 점검입니다. 할 일 없으면 [SILENT]로 응답.'}`;
-        console.log(`[heartbeat:${job["name"]}] tick (${describeHeartbeatSchedule(schedule)})`);
+        log.info(`[heartbeat:${job["name"]}] tick (${describeHeartbeatSchedule(schedule)})`);
         const requestId = crypto.randomUUID();
         const runResult = isEmployeeHeartbeat(job)
             ? await runEmployeeHeartbeatJob(job, prompt)
@@ -254,11 +255,11 @@ async function runHeartbeatJob(job: Record<string, any>) {
         const result = runResult.text;
 
         if (!runResult.visible || result.includes('[SILENT]')) {
-            console.log(`[heartbeat:${job["name"]}] silent`);
+            log.info(`[heartbeat:${job["name"]}] silent`);
             return;
         }
 
-        console.log(`[heartbeat:${job["name"]}] response: ${result.slice(0, 80)}`);
+        log.info(`[heartbeat:${job["name"]}] response: ${result.slice(0, 80)}`);
 
         // Send heartbeat result via active messaging channel
         const sendResult = await sendChannelOutput({
@@ -267,7 +268,7 @@ async function runHeartbeatJob(job: Record<string, any>) {
             text: result,
         });
         if (!sendResult.ok) {
-            console.error(`[heartbeat:${job["name"]}] send failed: ${sendResult.error}`);
+            log.error(`[heartbeat:${job["name"]}] send failed: ${sendResult.error}`);
         }
 
         // Record heartbeat anchor for context injection on next user turn
@@ -279,11 +280,11 @@ async function runHeartbeatJob(job: Record<string, any>) {
                     job["prompt"], result, now, now,
                 );
             } catch (e) {
-                console.error(`[heartbeat:${job["name"]}] anchor save failed:`, (e as Error).message);
+                log.error(`[heartbeat:${job["name"]}] anchor save failed:`, (e as Error).message);
             }
         }
     } catch (err) {
-        console.error(`[heartbeat:${job["name"]}] error:`, (err as Error).message);
+        log.error(`[heartbeat:${job["name"]}] error:`, (err as Error).message);
     } finally {
         heartbeatBusy = false;
         await drainPending();
@@ -296,7 +297,7 @@ export async function drainPending() {
     const next = pendingJobs.shift()?.job;
     if (!next) return;
     broadcast('heartbeat_pending', pendingSnapshot());
-    console.log(`[heartbeat:${next["name"]}] dequeued (${pendingJobs.length} remaining)`);
+    log.info(`[heartbeat:${next["name"]}] dequeued (${pendingJobs.length} remaining)`);
     await runHeartbeatJob(next);
 }
 
@@ -338,7 +339,7 @@ export function watchHeartbeatFile() {
             if (changed && changed !== name) return;
             clearTimeout(watchDebounce);
             watchDebounce = setTimeout(() => {
-                console.log('[heartbeat] file changed — reloading');
+                log.info('[heartbeat] file changed — reloading');
                 startHeartbeat();
             }, 500);
         });

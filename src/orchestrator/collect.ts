@@ -10,11 +10,18 @@ import {
 } from './pipeline.js';
 import { t } from '../core/i18n.js';
 
-export function orchestrateAndCollect(
+export interface CollectedOrchestrateResult {
+    text: string;
+    data: Record<string, any>;
+}
+
+/** Like orchestrateAndCollect, but resolves the full orchestrate_done payload
+ *  (e.g. elicitationSpecs for telegram inline keyboards) alongside the text. */
+export function orchestrateAndCollectData(
     prompt: string,
     meta: Record<string, any> = {},
     locale: string = 'ko',
-): Promise<string> {
+): Promise<CollectedOrchestrateResult> {
     return new Promise((resolve) => {
         let collected = '';
         let hadToolActivity = false;
@@ -25,7 +32,7 @@ export function orchestrateAndCollect(
             clearTimeout(timeout);
             timeout = setTimeout(() => {
                 removeBroadcastListener(handler);
-                resolve(collected || t('tg.timeout', {}, locale));
+                resolve({ text: collected || t('tg.timeout', {}, locale), data: {} });
             }, IDLE_TIMEOUT);
         }
 
@@ -50,13 +57,13 @@ export function orchestrateAndCollect(
                 clearTimeout(timeout);
                 removeBroadcastListener(handler);
                 const doneText = typeof data["text"] === 'string' ? data["text"] : '';
-                if (doneText.trim()) resolve(doneText);
-                else if (collected.trim()) resolve(collected);
+                if (doneText.trim()) resolve({ text: doneText, data });
+                else if (collected.trim()) resolve({ text: collected, data });
                 // AGY can exit 0 after completing heartbeat tools while its final
                 // [SILENT] transcript event races the tailer. Do not turn that
                 // intentional quiet completion into a user-visible failure.
-                else if (meta?.["origin"] === 'heartbeat' && hadToolActivity) resolve('[SILENT]');
-                else resolve(t('tg.noResponse', {}, locale));
+                else if (meta?.["origin"] === 'heartbeat' && hadToolActivity) resolve({ text: '[SILENT]', data });
+                else resolve({ text: t('tg.noResponse', {}, locale), data });
             }
         };
         addBroadcastListener(handler);
@@ -68,8 +75,16 @@ export function orchestrateAndCollect(
         Promise.resolve(run).catch(err => {
             clearTimeout(timeout);
             removeBroadcastListener(handler);
-            resolve(`❌ ${err.message}`);
+            resolve({ text: `❌ ${err.message}`, data: {} });
         });
         resetTimeout();
     });
+}
+
+export async function orchestrateAndCollect(
+    prompt: string,
+    meta: Record<string, any> = {},
+    locale: string = 'ko',
+): Promise<string> {
+    return (await orchestrateAndCollectData(prompt, meta, locale)).text;
 }
