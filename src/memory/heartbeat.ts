@@ -1,9 +1,9 @@
 // ─── Heartbeat (Scheduled Jobs + fs.watch) ───────────
 
 import fs from 'fs';
-import { basename, dirname } from 'path';
+import { basename, dirname, join } from 'path';
 import crypto from 'crypto';
-import { settings, HEARTBEAT_JOBS_PATH, loadHeartbeatFile, saveHeartbeatFile } from '../core/config.js';
+import { JAW_HOME, settings, HEARTBEAT_JOBS_PATH, loadHeartbeatFile, saveHeartbeatFile } from '../core/config.js';
 import { stripUndefined } from '../core/strip-undefined.js';
 import { getEmployees } from '../core/db.js';
 import { orchestrateAndCollect } from '../orchestrator/collect.js';
@@ -34,9 +34,12 @@ import {
     startHeartbeatCronLoop,
     validateHeartbeatCron,
 } from './heartbeat-schedule.js';
+import { HeartbeatSlotReceiptStore } from './heartbeat-slot-receipts.js';
+import { HeartbeatEventQueue } from './heartbeat-event-queue.js';
 
 const heartbeatTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const heartbeatCronSlots = new Map<string, string>();
+const heartbeatSlotReceipts = new HeartbeatSlotReceiptStore(join(JAW_HOME, 'state', 'heartbeat-slot-receipts.json'));
+const HEARTBEAT_SLOT_KEY = '__jawHeartbeatSlotKey';
 let heartbeatWatcher: fs.FSWatcher | null = null;
 let heartbeatBusy = false;
 type HeartbeatPendingReason = 'busy' | 'pabcd_active' | 'agent_busy';
@@ -52,6 +55,48 @@ type HeartbeatRunResult = {
     text: string;
     visible: boolean;
 };
+
+function heartbeatEventQueue(job: Record<string, any>): HeartbeatEventQueue | null {
+    const filePath = typeof job['eventQueuePath'] === 'string' ? job['eventQueuePath'].trim() : '';
+    return filePath ? new HeartbeatEventQueue(filePath) : null;
+}
+
+function settleHeartbeatEvents(job: Record<string, any>, since: number, status: 'delivered_by_arona' | 'delivery_uncertain'): void {
+    const queue = heartbeatEventQueue(job);
+    if (!queue) return;
+    try {
+        const events = queue.pendingSince(since);
+        queue.mark(events.map(event => event.id), status);
+    } catch (err) {
+        log.error(`[heartbeat:${job['name']}] event queue settle failed:`, (err as Error).message);
+    }
+}
+
+async function sendHeartbeatEventFallback(job: Record<string, any>, since: number, reason: string): Promise<boolean> {
+    const queue = heartbeatEventQueue(job);
+    if (!queue) return false;
+    try {
+        const events = queue.pendingSince(since);
+        const texts = events.map(event => event.fallbackText.trim()).filter(Boolean);
+        if (texts.length === 0) return false;
+
+        const sendResult = await sendChannelOutput({
+            channel: 'active',
+            type: 'text',
+            text: texts.join('\n\n'),
+        });
+        if (!sendResult.ok) {
+            log.error(`[heartbeat:${job['name']}] event fallback send failed: ${sendResult.error}`);
+            return false;
+        }
+        queue.mark(events.map(event => event.id), 'fallback_sent');
+        log.warn(`[heartbeat:${job['name']}] sent ${events.length} event fallback(s): ${reason}`);
+        return true;
+    } catch (err) {
+        log.error(`[heartbeat:${job['name']}] event fallback failed:`, (err as Error).message);
+        return false;
+    }
+}
 
 function pendingSnapshot(reason?: HeartbeatPendingReason, policy?: HeartbeatPendingPolicy) {
     const deferredPending = pendingJobs.filter(item => item.policy === 'defer').length;
@@ -217,10 +262,12 @@ export function startHeartbeat() {
 export function stopHeartbeat() {
     for (const timer of heartbeatTimers.values()) clearTimeout(timer);
     heartbeatTimers.clear();
-    heartbeatCronSlots.clear();
 }
 
 async function runHeartbeatJob(job: Record<string, any>) {
+    const slotKey = typeof job[HEARTBEAT_SLOT_KEY] === 'string' ? job[HEARTBEAT_SLOT_KEY] : '';
+    let started = false;
+    let outcome: 'completed' | 'failed' = 'completed';
     if (getState('default') !== 'IDLE') {
         const queued = queueHeartbeatJob(job, 'pabcd_active', 'defer');
         log.info(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active PABCD (${pendingJobs.length} pending)`);
@@ -240,6 +287,8 @@ async function runHeartbeatJob(job: Record<string, any>) {
         return;
     }
     heartbeatBusy = true;
+    started = true;
+    const eventWindowStart = Date.now();
     try {
         const schedule = normalizeHeartbeatSchedule(job["schedule"]);
         const timeZone = getHeartbeatScheduleTimeZone(schedule);
@@ -255,6 +304,8 @@ async function runHeartbeatJob(job: Record<string, any>) {
         const result = runResult.text;
 
         if (!runResult.visible || result.includes('[SILENT]')) {
+            const fallbackSent = await sendHeartbeatEventFallback(job, eventWindowStart, 'agent returned silent');
+            if (fallbackSent) return;
             log.info(`[heartbeat:${job["name"]}] silent`);
             return;
         }
@@ -269,10 +320,14 @@ async function runHeartbeatJob(job: Record<string, any>) {
         });
         if (!sendResult.ok) {
             log.error(`[heartbeat:${job["name"]}] send failed: ${sendResult.error}`);
+            // A delivery timeout can be ambiguous. Do not immediately send the
+            // fallback and risk a duplicate Telegram message.
+            settleHeartbeatEvents(job, eventWindowStart, 'delivery_uncertain');
         }
 
         // Record heartbeat anchor for context injection on next user turn
         if (sendResult.ok) {
+            settleHeartbeatEvents(job, eventWindowStart, 'delivered_by_arona');
             const now = Date.now();
             try {
                 insertHeartbeatAnchor.run(
@@ -284,8 +339,11 @@ async function runHeartbeatJob(job: Record<string, any>) {
             }
         }
     } catch (err) {
+        outcome = 'failed';
         log.error(`[heartbeat:${job["name"]}] error:`, (err as Error).message);
+        await sendHeartbeatEventFallback(job, eventWindowStart, 'agent execution failed');
     } finally {
+        if (started && slotKey) heartbeatSlotReceipts.finish(String(job['id']), slotKey, outcome);
         heartbeatBusy = false;
         await drainPending();
     }
@@ -316,9 +374,11 @@ function maybeRunCronJob(job: Record<string, any>) {
     const timeZone = getHeartbeatScheduleTimeZone(schedule);
     if (!matchesHeartbeatCron(schedule.cron, new Date(), timeZone)) return;
     const slotKey = getHeartbeatMinuteSlotKey(schedule);
-    if (heartbeatCronSlots.get(job["id"]) === slotKey) return;
-    heartbeatCronSlots.set(job["id"], slotKey);
-    void runHeartbeatJob(job);
+    if (!heartbeatSlotReceipts.claim(String(job['id']), slotKey)) {
+        log.info(`[heartbeat:${job["name"]}] already claimed slot ${slotKey}, skip`);
+        return;
+    }
+    void runHeartbeatJob({ ...job, [HEARTBEAT_SLOT_KEY]: slotKey });
 }
 
 function msUntilNextMinute(): number {
