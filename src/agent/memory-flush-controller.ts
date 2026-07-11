@@ -20,9 +20,9 @@ export function incrementMemoryFlush(): void {
     memoryFlushCounter++;
 }
 
-export function resetMemoryFlushCounter(): void {
+export function resetMemoryFlushCounter(countFlushCycle: boolean = true): void {
     memoryFlushCounter = 0;
-    flushCycleCount++;
+    if (countFlushCycle) flushCycleCount++;
 }
 
 // Forward reference to spawnAgent (avoid circular import)

@@ -60,6 +60,24 @@ export function shouldEnableAgyNativeResume(
     return perCliConfig?.['nativeResume'] === true && capabilities?.conversation === true;
 }
 
+/**
+ * The generic high-turn reset protects CLIs that cannot reliably continue after
+ * their own compaction. AGY has a native, compacted conversation store, so its
+ * bucket must survive until AGY explicitly reports that the conversation is stale.
+ */
+export function shouldClearHighTurnSessionBucket(cli: string, turns: number): boolean {
+    if (turns <= 15) return false;
+    return cli === 'codex' || cli === 'opencode' || cli === 'grok';
+}
+
+/**
+ * AGY compacts and resumes its own conversation. Applying jaw's generic
+ * turn-count refresh on top would discard a healthy native session.
+ */
+export function shouldUseTurnCountRefresh(cli: string): boolean {
+    return cli !== 'claude' && cli !== 'claude-e' && cli !== 'agy';
+}
+
 function parseBucketUpdatedAt(value: string | number | null | undefined): number | null {
     if (typeof value === 'number' && Number.isFinite(value)) {
         return value < 10_000_000_000 ? value * 1000 : value;

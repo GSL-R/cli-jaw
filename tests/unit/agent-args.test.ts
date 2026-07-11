@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { formatAgyPrintTimeout, resolveAgyAddDirectories } from '../../src/agent/args.ts';
 import { buildAiERuntimeStatusMeta, buildArgs, buildResumeArgs, resolveAiEProvider, resolveSessionBucket, shouldResumeBucketSession } from '../../src/agent/spawn.ts';
-import { shouldEnableAgyNativeResume } from '../../src/agent/spawn/resume.ts';
+import { shouldClearHighTurnSessionBucket, shouldEnableAgyNativeResume, shouldUseTurnCountRefresh } from '../../src/agent/spawn/resume.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -82,6 +82,24 @@ test('AG-000e2: agy native resume requires both opt-in and runtime capability', 
     assert.equal(shouldEnableAgyNativeResume({ nativeResume: false }, { conversation: true }), false);
     assert.equal(shouldEnableAgyNativeResume({ nativeResume: true }, { conversation: false }), false);
     assert.equal(shouldEnableAgyNativeResume(undefined, { conversation: true }), false);
+});
+
+test('AG-000e3: high-turn guard preserves AGY native conversations', () => {
+    assert.equal(shouldClearHighTurnSessionBucket('agy', 16), false);
+    assert.equal(shouldClearHighTurnSessionBucket('agy', 80), false);
+    assert.equal(shouldClearHighTurnSessionBucket('codex', 16), true);
+    assert.equal(shouldClearHighTurnSessionBucket('opencode', 16), true);
+    assert.equal(shouldClearHighTurnSessionBucket('grok', 16), true);
+    assert.equal(shouldClearHighTurnSessionBucket('codex', 15), false);
+});
+
+test('AG-000e4: proactive turn-count refresh excludes AGY native sessions', () => {
+    assert.equal(shouldUseTurnCountRefresh('agy'), false);
+    assert.equal(shouldUseTurnCountRefresh('claude'), false);
+    assert.equal(shouldUseTurnCountRefresh('claude-e'), false);
+    assert.equal(shouldUseTurnCountRefresh('codex'), true);
+    assert.equal(shouldUseTurnCountRefresh('opencode'), true);
+    assert.equal(shouldUseTurnCountRefresh('grok'), true);
 });
 
 test('AG-000f: agy supports per-run log file capture for print-mode session ids', () => {
