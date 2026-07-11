@@ -238,7 +238,9 @@ export function parseTranscriptLine(line: string): ToolEntry | null {
     return entry;
 }
 
-export type AgyTranscriptRowKind = 'tool' | 'final-planner' | 'planner' | 'provider-error' | 'meta' | 'invalid';
+export const AGY_INTERMEDIATE_PLANNER_PREFIXES = ['my_tool_call_analysis:'];
+
+export type AgyTranscriptRowKind = 'tool' | 'final-planner' | 'planner' | 'checkpoint' | 'provider-error' | 'meta' | 'invalid';
 
 function parseAgyTranscriptError(row: Record<string, unknown>): AgyTranscriptError {
     const rawMessage = typeof row['error'] === 'string'
@@ -284,9 +286,12 @@ export function classifyAgyTranscriptRow(line: string): { kind: AgyTranscriptRow
     }
     if (type === 'PLANNER_RESPONSE') {
         const content = typeof row['content'] === 'string' ? row['content'].trim() : '';
-        if (/^my_tool_call_analysis\s*:/i.test(content)) return { kind: 'planner' };
+        if (AGY_INTERMEDIATE_PLANNER_PREFIXES.some((prefix) => content.startsWith(prefix))) {
+            return { kind: 'planner' };
+        }
         return { kind: content && hasEmptyToolCalls(row) ? 'final-planner' : 'planner' };
     }
+    if (type === 'CHECKPOINT') return { kind: 'checkpoint' };
     if (NON_TOOL_TYPES.has(type)) return { kind: 'meta' };
     const tool = parseTranscriptLine(trimmed);
     return tool ? { kind: 'tool', tool } : { kind: 'tool' };
@@ -301,11 +306,8 @@ function isBroadPath(rawPath: unknown, roots: Set<string>): boolean {
     const value = unquoteAgyArg(rawPath);
     if (!value) return false;
     let normalized = value;
-    try {
-        normalized = path.resolve(value);
-    } catch {
-        normalized = value.replace(/\/+$/g, '') || value;
-    }
+    try { normalized = path.resolve(value); }
+    catch { normalized = value.replace(/\/+$/g, '') || value; }
     return roots.has(normalized.replace(/\/+$/g, '') || normalized);
 }
 
@@ -320,15 +322,10 @@ function unsafeReasonForToolCall(call: unknown): string | null {
     const record = call as Record<string, unknown>;
     const name = String(record['name'] || '').toLowerCase();
     const args = record['args'] && typeof record['args'] === 'object'
-        ? record['args'] as Record<string, unknown>
-        : {};
+        ? record['args'] as Record<string, unknown> : {};
     if (name === 'grep_search') {
-        if (isBroadPath(args['SearchPath'], BROAD_SEARCH_ROOTS)) {
-            return `unsafe AGY grep_search scope: ${unquoteAgyArg(args['SearchPath'])}`;
-        }
-        if (hasBroadShellSearch(JSON.stringify(args))) {
-            return 'unsafe AGY grep_search task includes broad home search';
-        }
+        if (isBroadPath(args['SearchPath'], BROAD_SEARCH_ROOTS)) return `unsafe AGY grep_search scope: ${unquoteAgyArg(args['SearchPath'])}`;
+        if (hasBroadShellSearch(JSON.stringify(args))) return 'unsafe AGY grep_search task includes broad home search';
     }
     if (name === 'list_dir' && isBroadPath(args['DirectoryPath'], BROAD_ROOTS)) {
         return `unsafe AGY list_dir scope: ${unquoteAgyArg(args['DirectoryPath'])}`;
@@ -341,11 +338,8 @@ function unsafeReasonForToolCall(call: unknown): string | null {
 
 export function detectUnsafeAgyLocalToolRequest(line: string): string | null {
     let row: Record<string, unknown>;
-    try {
-        row = JSON.parse(line.trim()) as Record<string, unknown>;
-    } catch {
-        return null;
-    }
+    try { row = JSON.parse(line.trim()) as Record<string, unknown>; }
+    catch { return null; }
     const type = typeof row['type'] === 'string' ? row['type'] : '';
     if (type === 'PLANNER_RESPONSE' && Array.isArray(row['tool_calls'])) {
         for (const call of row['tool_calls']) {
@@ -355,12 +349,8 @@ export function detectUnsafeAgyLocalToolRequest(line: string): string | null {
     }
     if (type === 'GREP_SEARCH') {
         const content = String(row['content'] || '');
-        if (/Grep command timed out due to the size of the codebase/i.test(content)) {
-            return 'AGY grep_search timed out due to broad codebase scope';
-        }
-        if (hasBroadShellSearch(content)) {
-            return 'unsafe AGY grep_search content includes broad home search';
-        }
+        if (/Grep command timed out due to the size of the codebase/i.test(content)) return 'AGY grep_search timed out due to broad codebase scope';
+        if (hasBroadShellSearch(content)) return 'unsafe AGY grep_search content includes broad home search';
     }
     if (type === 'RUN_COMMAND' && hasBroadShellSearch(String(row['content'] || ''))) {
         return 'unsafe AGY run_command content includes broad home search';

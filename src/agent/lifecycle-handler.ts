@@ -5,7 +5,7 @@ import fs from 'fs';
 import type { ChildProcess } from 'child_process';
 import { broadcast } from '../core/bus.js';
 import { settings, detectCli } from '../core/config.js';
-import { clearEmployeeSession, insertMessage, insertMessageWithTraceRun, updateSession, clearSessionBucket, markAnchorConsumed } from '../core/db.js';
+import { clearEmployeeSession, insertMessage, insertMessageWithTraceRun, updateSession, clearSessionBucket, markAnchorConsumed, updateSessionBucketLastRun } from '../core/db.js';
 import { getActiveChatSession } from '../core/chat-sessions.js';
 import { persistMainSession } from './session-persistence.js';
 import { resolveSessionBucket } from './args.js';
@@ -33,6 +33,8 @@ import {
 import { buildGoalContinuation } from '../goal/heartbeat.js';
 import { completeGoal, cancelGoal, getActiveGoal, goalHasCompletionEvidence } from '../goal/store.js';
 import { recordTurn } from '../goal-run/controller.js';
+import { applyOutputPolicy } from '../core/policy-hooks.js';
+import { evaluateRecordPending } from '../core/policy-flags.js';
 
 const GOAL_CONT_MAX_ATTEMPTS = 20;
 let _goalContAttempts = 0;
@@ -137,6 +139,8 @@ type LifecycleResolveResult = {
     tools?: ToolEntry[];
     smoke?: SmokeDetectionResult;
     diagnostic?: string;
+    agyCheckpointSeen?: boolean;
+    agyPlannerOnly?: boolean;
 };
 
 type SpawnAgentRef = (
@@ -192,6 +196,7 @@ export interface ExitContext {
     toolLog: ToolEntry[];
     traceLog: string[];
     stderrBuf: string;
+    metadata?: Record<string, unknown>;
     liveScope?: string | null;
     traceRunId?: string | null;
     liveOutputText?: string;
@@ -376,6 +381,17 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
     })) {
         console.log(`[jaw:session] saved ${cli} session=${persistedSessionId.slice(0, 12)}...${wasKilled ? ' (post-kill)' : ''}`);
     }
+    if (cli === 'agy' && persistedSessionId) {
+        const checkpointSeen = ctx.metadata?.['agyCheckpointSeen'] === true;
+        const plannerOnly = ctx.metadata?.['agyPlannerOnly'] === true;
+        const clean = code === 0 && !wasKilled && !ctx.stallReason && !plannerOnly && !checkpointSeen;
+        updateSessionBucketLastRun.run(
+            clean ? 1 : 0,
+            settings['workingDir'] || '',
+            JSON.stringify({ checkpointSeen, plannerOnly, exitCode: code, at: Date.now() }),
+            resolveSessionBucket(cli, model, effectiveProvider),
+        );
+    }
 
     // ─── Phase 54-A: Proactive compact by turn count ───
     // CLIs without a reliable native compact/resume path get a conservative
@@ -520,6 +536,8 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
         }
 
         if (mainManaged && !opts.internal) {
+            finalContent = applyOutputPolicy(finalContent, { scope: 'main' }).text;
+            evaluateRecordPending(ctx.toolLog, finalContent);
             const structuredFence = scanStructuredFence(finalContent);
             if (structuredFence.status === 'incomplete') {
                 console.warn('[lifecycle] assistant output contains incomplete structured fence before durable insert', {
@@ -882,6 +900,10 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
         sessionId: ctx.sessionId, cost: ctx.cost,
         tools: ctx.toolLog, smoke: smokeResult,
         diagnostic,
+        ...(typeof ctx.metadata?.['agyCheckpointSeen'] === 'boolean'
+            ? { agyCheckpointSeen: ctx.metadata['agyCheckpointSeen'] } : {}),
+        ...(typeof ctx.metadata?.['agyPlannerOnly'] === 'boolean'
+            ? { agyPlannerOnly: ctx.metadata['agyPlannerOnly'] } : {}),
         ...(params.outputLen ? { outputLen: params.outputLen } : {}),
     });
 

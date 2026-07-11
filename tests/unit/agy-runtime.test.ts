@@ -14,6 +14,7 @@ import {
     describeAgyFinalSource,
     extractAgyConversationId,
     finalizeAgyFallbackText,
+    AGY_PLANNER_ONLY_NOTICE,
     formatAgyTimeoutMessage,
     formatAgyTranscriptErrorMessage,
     getAgyQuietCompletionDelayMs,
@@ -274,10 +275,12 @@ test('AGY-RT-012: AGY resume does not trim current stdout by prior output length
     assert.doesNotMatch(resumeOffsetBlock, /bucketRow\?\.output_len|employeeOutputLen/);
 });
 
-test('AGY-RT-012b: AGY native resume is opt-in and capability gated', () => {
+test('AGY-RT-012b: AGY native resume uses the guarded v2.2.6 decision', () => {
     const spawnSrc = readFileSync(join(__dirname, '../../src/agent/spawn.ts'), 'utf8');
-    assert.match(spawnSrc, /const agyNativeResumeEnabled = cli === 'agy'[\s\S]{0,120}shouldEnableAgyNativeResume\(cfg, agyCapabilities\)/);
-    assert.match(spawnSrc, /const providerSupportsResume = \(cli !== 'agy' \|\| agyNativeResumeEnabled\)/);
+    assert.match(spawnSrc, /const agyResumeDecision = canGuardedAgyResume\(\{/);
+    assert.match(spawnSrc, /mode: resolveAgyNativeResume\(cfg\.nativeResume\)/);
+    assert.match(spawnSrc, /conversationSupported: agyCapabilities\?\.conversation === true/);
+    assert.match(spawnSrc, /: agyResumeDecision\.ok/);
     assert.match(spawnSrc, /const needsHistory\s*=\s*!opts\._skipHistory && \(!isResume \|\| cli === 'pi'\)/);
 });
 
@@ -603,6 +606,19 @@ test('AGY-RT-022: finalizeAgyFallbackText no-ops for transcript-anchored or unto
         agyFullTextTruncated: undefined as boolean | undefined,
     };
     assert.equal(finalizeAgyFallbackText(untouched, 'same'), false);
+});
+
+test('AGY-RT-023: stdout fallback with an intermediate planner prefix is withheld', () => {
+    const ctx = {
+        fullText: 'my_tool_call_analysis: inspect state',
+        liveOutputText: 'my_tool_call_analysis: inspect',
+        agyFinalPlannerSeen: false,
+        metadata: {},
+    };
+    assert.equal(finalizeAgyFallbackText(ctx, ctx.fullText), true);
+    assert.equal(ctx.fullText, AGY_PLANNER_ONLY_NOTICE);
+    assert.equal(ctx.liveOutputText, AGY_PLANNER_ONLY_NOTICE);
+    assert.equal(ctx.metadata.agyPlannerOnly, true);
 });
 
 test('AGY-RT-023: describeAgyFinalSource reports mode and truncation for diagnosability', () => {

@@ -7,6 +7,7 @@ import { assertSendFilePath } from '../security/path-guards.js';
 import type { MessengerChannel, OutboundType, RemoteTarget } from './types.js';
 import { getLastActiveTarget, getLatestSeenTarget, clearTargetState } from './runtime.js';
 import { persistTelegramOutbox } from '../telegram/delivery-outbox.js';
+import { applyOutputPolicy } from '../core/policy-hooks.js';
 
 // ─── Request Model ──────────────────────────────────
 
@@ -214,6 +215,9 @@ export async function sendChannelOutput(req: ChannelSendRequest): Promise<{ ok: 
         return { ok: false, error: `No send transport registered for ${channel}` };
     }
 
+    if (typeof req.text === 'string') {
+        req.text = applyOutputPolicy(req.text, { scope: 'main', channel }).text;
+    }
     const result = await sendFn(req);
     const status = Number(result['statusCode'] ?? result['status'] ?? 0);
     if (channel === 'telegram' && !result.ok && status === 429) {

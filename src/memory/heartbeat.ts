@@ -3,27 +3,24 @@
 import fs from 'fs';
 import { basename, dirname, join } from 'path';
 import crypto from 'crypto';
+import { execFile } from 'node:child_process';
 import { JAW_HOME, settings, HEARTBEAT_JOBS_PATH, loadHeartbeatFile, saveHeartbeatFile } from '../core/config.js';
 import { stripUndefined } from '../core/strip-undefined.js';
-import { getEmployees } from '../core/db.js';
-import { orchestrateAndCollect } from '../orchestrator/collect.js';
-import { isAgentBusy, messageQueue, spawnAgent } from '../agent/spawn.js';
-import { getEmployeePrompt } from '../prompt/builder.js';
-import { findEmployee } from '../orchestrator/distribute.js';
-import {
-    claimWorker,
-    failWorker,
-    finishWorker,
-    hasPendingWorkerReplays,
-    updateWorkerTools,
-    WorkerBusyError,
-} from '../orchestrator/worker-registry.js';
+import { isAgentBusy, messageQueue } from '../agent/spawn.js';
+import { orchestrateAndCollectData } from '../orchestrator/collect.js';
+import { claimWorker, failWorker, finishWorker, WorkerBusyError } from '../orchestrator/worker-registry.js';
+import { hasPendingWorkerReplays } from '../orchestrator/worker-registry.js';
 import { broadcast } from '../core/bus.js';
 import { sendChannelOutput } from '../messaging/send.js';
-import { insertHeartbeatAnchor } from '../core/db.js';
+import { getEmployees, insertHeartbeatAnchor } from '../core/db.js';
+import type { EmployeeRow } from '../core/employees.js';
+import { runSingleAgent } from '../orchestrator/distribute.js';
 import { getState } from '../orchestrator/state-machine.js';
 import { getGoalContinuationPrompt } from '../goal/heartbeat.js';
 import { log } from '../core/logger.js';
+import { applyOutputPolicy, loadPolicyHooksConfig } from '../core/policy-hooks.js';
+import { setRecordPending } from '../core/policy-flags.js';
+import { parseHeartbeatReport, type HeartbeatReport } from './heartbeat-report.js';
 import {
     describeHeartbeatSchedule,
     formatHeartbeatNow,
@@ -51,10 +48,9 @@ interface PendingHeartbeatJob {
 }
 const pendingJobs: PendingHeartbeatJob[] = [];
 
-type HeartbeatRunResult = {
-    text: string;
-    visible: boolean;
-};
+export function isHeartbeatQuietOutput(result: string, extraMarkers: string[] = []): boolean {
+    return ['[SILENT]', ...extraMarkers].some(marker => marker.length > 0 && result.includes(marker));
+}
 
 function heartbeatEventQueue(job: Record<string, any>): HeartbeatEventQueue | null {
     const filePath = typeof job['eventQueuePath'] === 'string' ? job['eventQueuePath'].trim() : '';
@@ -67,8 +63,8 @@ function settleHeartbeatEvents(job: Record<string, any>, since: number, status: 
     try {
         const events = queue.pendingSince(since);
         queue.mark(events.map(event => event.id), status);
-    } catch (err) {
-        log.error(`[heartbeat:${job['name']}] event queue settle failed:`, (err as Error).message);
+    } catch (error) {
+        log.error(`[heartbeat:${job['name']}] event queue settle failed:`, (error as Error).message);
     }
 }
 
@@ -79,12 +75,7 @@ async function sendHeartbeatEventFallback(job: Record<string, any>, since: numbe
         const events = queue.pendingSince(since);
         const texts = events.map(event => event.fallbackText.trim()).filter(Boolean);
         if (texts.length === 0) return false;
-
-        const sendResult = await sendChannelOutput({
-            channel: 'active',
-            type: 'text',
-            text: texts.join('\n\n'),
-        });
+        const sendResult = await sendChannelOutput({ channel: 'active', type: 'text', text: texts.join('\n\n') });
         if (!sendResult.ok) {
             log.error(`[heartbeat:${job['name']}] event fallback send failed: ${sendResult.error}`);
             return false;
@@ -92,8 +83,8 @@ async function sendHeartbeatEventFallback(job: Record<string, any>, since: numbe
         queue.mark(events.map(event => event.id), 'fallback_sent');
         log.warn(`[heartbeat:${job['name']}] sent ${events.length} event fallback(s): ${reason}`);
         return true;
-    } catch (err) {
-        log.error(`[heartbeat:${job['name']}] event fallback failed:`, (err as Error).message);
+    } catch (error) {
+        log.error(`[heartbeat:${job['name']}] event fallback failed:`, (error as Error).message);
         return false;
     }
 }
@@ -129,112 +120,6 @@ export function getHeartbeatRuntimeState() {
     return pendingSnapshot();
 }
 
-function heartbeatReportPolicy(job: Record<string, any>): 'always' | 'anomaly_only' | 'silent' {
-    const raw = typeof job["reportPolicy"] === 'string' ? job["reportPolicy"].toLowerCase() : '';
-    if (raw === 'anomaly_only' || raw === 'silent' || raw === 'always') return raw;
-    return 'always';
-}
-
-function isEmployeeHeartbeat(job: Record<string, any>): boolean {
-    return job["runner"] === 'employee' || typeof job["employee"] === 'string';
-}
-
-function shouldShowEmployeeResult(text: string, policy: 'always' | 'anomaly_only' | 'silent'): boolean {
-    if (policy === 'always') return true;
-    if (policy === 'silent') return false;
-    const lower = text.toLowerCase();
-    if (/status\s*:\s*(warning|failed|fail|error)/i.test(text)) return true;
-    if (/user_visible\s*:\s*(yes|true)/i.test(text)) return true;
-    if (/record_required\s*:\s*(yes|true)/i.test(text)) return true;
-    if (lower.includes('warning') || lower.includes('failed') || lower.includes('error')) return true;
-    if (text.includes('⚠') || text.includes('❌')) return true;
-    return false;
-}
-
-async function runEmployeeHeartbeatJob(job: Record<string, any>, prompt: string): Promise<HeartbeatRunResult> {
-    const employeeName = String(job["employee"] || job["agent"] || '').trim();
-    if (!employeeName) {
-        return {
-            text: `❌ heartbeat employee runner requires job.employee`,
-            visible: true,
-        };
-    }
-    const emps = getEmployees.all() as Record<string, any>[];
-    const emp = findEmployee(emps, { agent: employeeName });
-    if (!emp) {
-        return {
-            text: `❌ heartbeat employee not found: ${employeeName}`,
-            visible: true,
-        };
-    }
-
-    const task = [
-        prompt,
-        '',
-        '## Heartbeat Employee Report Contract',
-        'Return a concise report in this exact shape:',
-        'status: ok | warning | failed',
-        'changed: yes | no',
-        'record_required: yes | no',
-        'user_visible: yes | no',
-        'summary: ...',
-        'evidence: ...',
-        'next_action: ...',
-        '',
-        'If everything is normal and no user-facing action is needed, set status: ok and user_visible: no.',
-    ].join('\n');
-
-    let slot: ReturnType<typeof claimWorker> | null = null;
-    try {
-        slot = claimWorker({ id: String(emp["id"]), name: String(emp["name"] || emp["id"]) }, task, { origin: 'heartbeat' });
-    } catch (err) {
-        if (err instanceof WorkerBusyError) {
-            return {
-                text: `❌ heartbeat employee busy: ${err.existing.employeeName}`,
-                visible: true,
-            };
-        }
-        throw err;
-    }
-
-    try {
-        const sysPrompt = getEmployeePrompt({
-            name: String(emp["name"] || emp["id"]),
-            role: String(job["role"] || emp["role"] || 'heartbeat maintenance worker'),
-            id: String(emp["id"]),
-        });
-        const { promise } = spawnAgent(task, {
-            agentId: String(emp["id"]),
-            cli: String(emp["cli"] || settings["cli"] || ''),
-            model: String(emp["model"] || ''),
-            forceNew: job["resumeEmployee"] !== true,
-            sysPrompt,
-            origin: 'heartbeat',
-            env: {
-                JAW_EMPLOYEE_MODE: '1',
-                JAW_EMPLOYEE_NAME: String(emp["name"] || ''),
-                JAW_EMPLOYEE_ROLE: String(job["role"] || emp["role"] || 'heartbeat maintenance worker'),
-                JAW_WORKSPACE_ROOT: settings["workingDir"] || '',
-                PORT: String(process.env["PORT"] || ''),
-            },
-        });
-        const result = await promise as Record<string, unknown>;
-        const text = String(result["text"] || '').trim() || '[SILENT]';
-        const tools = Array.isArray(result["tools"]) ? result["tools"] : [];
-        updateWorkerTools(slot.agentId, tools as any[]);
-        finishWorker(slot.agentId, text, tools as any[]);
-        const policy = heartbeatReportPolicy(job);
-        return {
-            text,
-            visible: shouldShowEmployeeResult(text, policy),
-        };
-    } catch (err) {
-        const text = `❌ heartbeat employee runner failed: ${(err as Error).message}`;
-        if (slot) failWorker(slot.agentId, text);
-        return { text, visible: true };
-    }
-}
-
 export function startHeartbeat() {
     stopHeartbeat();
     const { jobs } = loadHeartbeatFile();
@@ -264,11 +149,55 @@ export function stopHeartbeat() {
     heartbeatTimers.clear();
 }
 
-async function runHeartbeatJob(job: Record<string, any>) {
+export interface HeartbeatReportDecision { send: boolean; anchor: boolean; delivered: boolean }
+
+export function decideHeartbeatReport(report: HeartbeatReport, policy: string): HeartbeatReportDecision {
+    if (policy === 'silent') return { send: false, anchor: true, delivered: false };
+    if (policy === 'anomaly_only') {
+        const send = report.status !== 'ok' || report.userVisible;
+        return { send, anchor: true, delivered: send };
+    }
+    return { send: true, anchor: true, delivered: true };
+}
+
+export function runHeartbeatScript(command: string[]): Promise<HeartbeatReport> {
+    return new Promise(resolve => {
+        const [file, ...args] = command;
+        if (!file) { resolve(parseHeartbeatReport('', 1)); return; }
+        execFile(file, args, { timeout: 10 * 60_000, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
+            const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : error ? 1 : 0;
+            resolve(parseHeartbeatReport([stdout, stderr].filter(Boolean).join('\n'), code));
+        });
+    });
+}
+
+async function runEmployee(job: Record<string, any>, prompt: string): Promise<HeartbeatReport> {
+    const emp = (getEmployees.all() as EmployeeRow[]).find(row => row.name === job["employee"]);
+    if (!emp) return parseHeartbeatReport('status: failed\nsummary: employee not found');
+    try {
+        const slot = claimWorker(emp, prompt, { origin: 'heartbeat' });
+        try {
+            const ap = { agent: emp.name, role: emp.role || 'general developer', task: prompt, parallel: false, currentPhase: 0, currentPhaseIdx: 0, phaseProfile: [0], mutable: false, scope: null, task_tags: ['heartbeat'] };
+            const result = await runSingleAgent(ap, emp, { tag: `heartbeat:${job["id"] || job["name"]}` }, 1, { origin: 'heartbeat' }, []);
+            const text = String(result["text"] || '');
+            finishWorker(slot.agentId, text, Array.isArray(result["tools"]) ? result["tools"] : []);
+            return parseHeartbeatReport(text);
+        } catch (error) {
+            failWorker(slot.agentId, error instanceof Error ? error.message : String(error));
+            throw error;
+        }
+    } catch (error) {
+        if (error instanceof WorkerBusyError) return parseHeartbeatReport('status: warning\nsummary: skipped: employee busy');
+        throw error;
+    }
+}
+
+export async function runHeartbeatJob(job: Record<string, any>) {
     const slotKey = typeof job[HEARTBEAT_SLOT_KEY] === 'string' ? job[HEARTBEAT_SLOT_KEY] : '';
     let started = false;
     let outcome: 'completed' | 'failed' = 'completed';
-    if (getState('default') !== 'IDLE') {
+    const runner = job["runner"] || 'main';
+    if (runner === 'main' && getState('default') !== 'IDLE') {
         const queued = queueHeartbeatJob(job, 'pabcd_active', 'defer');
         log.info(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active PABCD (${pendingJobs.length} pending)`);
         return;
@@ -281,11 +210,12 @@ async function runHeartbeatJob(job: Record<string, any>) {
         }
         return;
     }
-    if (isAgentBusy()) {
+    if (runner === 'main' && isAgentBusy()) {
         const queued = queueHeartbeatJob(job, 'agent_busy', 'defer');
         log.info(`[heartbeat:${job["name"]}] ${queued ? 'deferred' : 'already deferred'} during active main agent (${pendingJobs.length} pending)`);
         return;
     }
+    // Main IDLE runs historically reached orchestrateAndCollect(prompt); wp4 uses its data-returning form.
     heartbeatBusy = true;
     started = true;
     const eventWindowStart = Date.now();
@@ -297,42 +227,56 @@ async function runHeartbeatJob(job: Record<string, any>) {
         const goalSection = goalPrompt ? `\n\n--- Active Goal ---\n${goalPrompt}\n--- End Goal ---\n` : '';
         const prompt = `[heartbeat:${job["name"]}] 현재 시간: ${now} (${timeZone})\n\nHeartbeat task rule: run the job's explicit script or narrow task first. Do not perform startup self-audit, provider config inspection, broad file search, or memory search unless the job itself needs historical context and no canonical tool/path is available.${goalSection}\n\n${job["prompt"] || '정기 점검입니다. 할 일 없으면 [SILENT]로 응답.'}`;
         log.info(`[heartbeat:${job["name"]}] tick (${describeHeartbeatSchedule(schedule)})`);
-        const requestId = crypto.randomUUID();
-        const runResult = isEmployeeHeartbeat(job)
-            ? await runEmployeeHeartbeatJob(job, prompt)
-            : { text: String(await orchestrateAndCollect(prompt, { origin: 'heartbeat', requestId })), visible: true };
-        const result = runResult.text;
+        let rawResult: string;
+        if (runner === 'employee') {
+            rawResult = (await runEmployee(job, prompt)).raw;
+        } else if (runner === 'script') {
+            const scriptReport = await runHeartbeatScript(job["command"] || []);
+            rawResult = scriptReport.status === 'failed' && !/^status:/m.test(scriptReport.raw)
+                ? `${scriptReport.raw}\nstatus: failed\nsummary: ${scriptReport.summary || 'script failed'}`
+                : scriptReport.raw;
+        } else {
+            const first = await orchestrateAndCollectData(prompt, { origin: 'heartbeat', requestId: crypto.randomUUID() });
+            const collected = first.data.agyPlannerOnly === true
+                ? await orchestrateAndCollectData(prompt, { origin: 'heartbeat', requestId: crypto.randomUUID() })
+                : first;
+            rawResult = String(collected.text);
+        }
+        const result = applyOutputPolicy(rawResult, { scope: 'heartbeat', channel: 'active' }).text;
 
-        if (!runResult.visible || result.includes('[SILENT]')) {
+        const quietConfig = loadPolicyHooksConfig()?.flags?.heartbeatQuietOk;
+        const extraQuietMarkers = quietConfig?.enabled ? (quietConfig.markers || []) : [];
+        if (isHeartbeatQuietOutput(result, extraQuietMarkers)) {
             const fallbackSent = await sendHeartbeatEventFallback(job, eventWindowStart, 'agent returned silent');
             if (fallbackSent) return;
             log.info(`[heartbeat:${job["name"]}] silent`);
             return;
         }
 
+        const report = parseHeartbeatReport(result);
+        if (report.recordRequired) setRecordPending(report.evidence || report.summary || result);
+        const policy = job["reportPolicy"] || 'always';
+        const decision = decideHeartbeatReport(report, policy);
+        const deliveryText = report.summary || result;
+        const formatted = report.status === 'ok' ? deliveryText : `[${report.status}] ${deliveryText}`;
+
         log.info(`[heartbeat:${job["name"]}] response: ${result.slice(0, 80)}`);
 
         // Send heartbeat result via active messaging channel
-        const sendResult = await sendChannelOutput({
-            channel: 'active',
-            type: 'text',
-            text: result,
-        });
+        const sendResult = decision.send ? await sendChannelOutput({ channel: 'active', type: 'text', text: formatted }) : { ok: true as const };
         if (!sendResult.ok) {
             log.error(`[heartbeat:${job["name"]}] send failed: ${sendResult.error}`);
-            // A delivery timeout can be ambiguous. Do not immediately send the
-            // fallback and risk a duplicate Telegram message.
             settleHeartbeatEvents(job, eventWindowStart, 'delivery_uncertain');
         }
 
         // Record heartbeat anchor for context injection on next user turn
-        if (sendResult.ok) {
-            settleHeartbeatEvents(job, eventWindowStart, 'delivered_by_arona');
+        if (decision.anchor && sendResult.ok) {
+            if (decision.send) settleHeartbeatEvents(job, eventWindowStart, 'delivered_by_arona');
             const now = Date.now();
             try {
                 insertHeartbeatAnchor.run(
                     job["id"], job["name"], settings["workingDir"], 'active', null,
-                    job["prompt"], result, now, now,
+                    job["prompt"], decision.delivered ? formatted : `[quiet] ${formatted}`, now, decision.delivered ? now : null,
                 );
             } catch (e) {
                 log.error(`[heartbeat:${job["name"]}] anchor save failed:`, (e as Error).message);

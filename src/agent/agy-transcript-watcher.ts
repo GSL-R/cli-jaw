@@ -48,7 +48,6 @@ function transcriptMtimeMs(transcriptPath: string): number {
         return 0;
     }
 }
-
 export function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreatedAtMs: number): void {
     let rowType = '';
     let createdAtMs: number | null = null;
@@ -73,11 +72,12 @@ export function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreat
     }
     // A USER_INPUT row marks the current turn's start: any final-planner flag set by a
     // previous turn's row that slipped inside the lookback buffer (fast resume) is stale.
-    if (rowType === 'USER_INPUT' || rowType === 'CHECKPOINT') {
+    if (rowType === 'USER_INPUT') {
         ctx.agyFinalPlannerSeen = false;
         ctx.agyFinalPlannerText = undefined;
         ctx.agyIntermediatePlannerTexts = [];
         ctx.agyLastTranscriptError = undefined;
+        ctx.metadata = { ...ctx.metadata, agyCheckpointSeen: false, agyPlannerOnly: false };
         return;
     }
     const { kind, error } = classifyAgyTranscriptRow(line);
@@ -96,7 +96,13 @@ export function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreat
             ctx.agyFinalPlannerSeen = true;
             ctx.agyFinalPlannerText = rowContent;
             ctx.agyLastTranscriptError = undefined;
+            ctx.metadata = { ...ctx.metadata, agyPlannerOnly: false };
         }
+    } else if (kind === 'checkpoint') {
+        ctx.agyFinalPlannerSeen = false;
+        ctx.agyFinalPlannerText = undefined;
+        ctx.agyLastTranscriptError = undefined;
+        ctx.metadata = { ...ctx.metadata, agyCheckpointSeen: true };
     } else if (kind === 'tool' || kind === 'planner') {
         ctx.agyFinalPlannerSeen = false;
         ctx.agyFinalPlannerText = undefined;
@@ -104,7 +110,12 @@ export function updateFinalPlannerFlag(ctx: SpawnContext, line: string, minCreat
         // actual final answer. After a quota/capacity error AGY commonly emits
         // one or more empty PLANNER_RESPONSE rows before exiting successfully;
         // clearing here turns that failed run into exit 0 and suppresses the
-        // configured cross-provider fallback.
+        // configured cross-provider fallback. Still update planner-only metadata
+        // for the guarded retry boundary introduced in v2.2.6.
+        ctx.metadata = {
+            ...ctx.metadata,
+            ...(kind === 'tool' ? { agyPlannerOnly: false } : rowContent ? { agyPlannerOnly: true } : {}),
+        };
     }
 }
 
@@ -195,6 +206,7 @@ export function startAgyTranscriptWatcher(options: {
         options.ctx.agyFinalPlannerText = undefined;
         options.ctx.agyIntermediatePlannerTexts = [];
         options.ctx.agyLastTranscriptError = undefined;
+        options.ctx.metadata = { ...options.ctx.metadata, agyCheckpointSeen: false, agyPlannerOnly: false };
     };
 
     const selectTranscript = (currentSessionId: string | null, force: boolean): void => {
@@ -232,6 +244,7 @@ export function startAgyTranscriptWatcher(options: {
         options.ctx.agyFinalPlannerText = undefined;
         options.ctx.agyIntermediatePlannerTexts = [];
         options.ctx.agyLastTranscriptError = undefined;
+        options.ctx.metadata = { ...options.ctx.metadata, agyCheckpointSeen: false, agyPlannerOnly: false };
         console.log(`[jaw:agy:transcript] tailing ${transcriptPath} (current-turn filter from ${new Date(startedAt).toISOString()})`);
     };
 
