@@ -510,6 +510,7 @@ export function getSystemPrompt(opts: { currentPrompt?: string; forDisk?: boolea
     // Project root is now injected per-message in spawn.ts (user prompt wrapper)
     const currentPrompt = String(opts.currentPrompt || '').trim();
     const forDisk = opts.forDisk === true;
+    const bossOrchestrationPrompt = settings["bossOrchestrationPrompt"] !== false;
 
     // Phase 15: Telegram guidance is now part of A1_CONTENT (hardcoded)
     // No dynamic injection needed — Bot-First policy with curl examples included
@@ -543,7 +544,7 @@ export function getSystemPrompt(opts: { currentPrompt?: string; forDisk?: boolea
         } catch { /* memory not ready for disk generation */ }
     }
 
-    try {
+    if (bossOrchestrationPrompt) try {
         const emps = getEmployees.all();
         if (emps.length > 0) {
             const list = emps.map(e => {
@@ -574,14 +575,15 @@ It defines phase contracts, dispatch pitfalls (delegation trap, context drift, p
         }
     } catch { /* DB not ready yet */ }
 
-    // Boss Dev Work Classification contract (92_runtime_skill_routing_plan).
-    // Compact, unconditional — renders identically with or without employees.
-    prompt += '\n\n---\n## Dev Work Classification (contract)\n';
-    prompt += 'Before coding, classify work C0-C5 (C0 trivial text, C1 single-file local, C2 ordinary product slice — endpoint/form/screen, C3 cross-domain — multiple modules/public API, C4 high-risk — auth/payments/security/data deletion/migration/release/permissions, C5 research/ambiguous). When signals match two classes, the higher class wins.\n';
-    prompt += 'Use direct mode for C0-C1, a compact plan for C2, compact/full PABCD for C3 when persistence, public contract, or architecture risk requires it, full PABCD for C4, research/interview for C5.\n';
-    prompt += 'Dispatch employees only for independent specialist work, plan/build verification, or high-risk review. Optional dispatch `task_tags` (e.g. tdd, threat_model, migration_backfill, frontend_ui) add specialist guidance without changing the employee role.\n';
-    prompt += 'C4-promotion triggers (DEV-ESCALATE-01: security, data deletion/migration, destructive ops, public contract change, release surface, permission model, new dependency/framework) override any fast path and promote the affected part to C4-level care. Ask the user before destructive actions, new dependency/framework, public API/schema change, irreversible migration, permission model change, or unresolved business ambiguity.\n';
-    prompt += 'Verify with the narrowest command that proves the claim; run affected-suite gates for C3 and full relevant gates for C4 or release-sensitive work.\n';
+    if (bossOrchestrationPrompt) {
+        // Boss Dev Work Classification contract (92_runtime_skill_routing_plan).
+        prompt += '\n\n---\n## Dev Work Classification (contract)\n';
+        prompt += 'Before coding, classify work C0-C5 (C0 trivial text, C1 single-file local, C2 ordinary product slice — endpoint/form/screen, C3 cross-domain — multiple modules/public API, C4 high-risk — auth/payments/security/data deletion/migration/release/permissions, C5 research/ambiguous). When signals match two classes, the higher class wins.\n';
+        prompt += 'Use direct mode for C0-C1, a compact plan for C2, compact/full PABCD for C3 when persistence, public contract, or architecture risk requires it, full PABCD for C4, research/interview for C5.\n';
+        prompt += 'Dispatch employees only for independent specialist work, plan/build verification, or high-risk review. Optional dispatch `task_tags` (e.g. tdd, threat_model, migration_backfill, frontend_ui) add specialist guidance without changing the employee role.\n';
+        prompt += 'C4-promotion triggers (DEV-ESCALATE-01: security, data deletion/migration, destructive ops, public contract change, release surface, permission model, new dependency/framework) override any fast path and promote the affected part to C4-level care. Ask the user before destructive actions, new dependency/framework, public API/schema change, irreversible migration, permission model change, or unresolved business ambiguity.\n';
+        prompt += 'Verify with the narrowest command that proves the claim; run affected-suite gates for C3 and full relevant gates for C4 or release-sensitive work.\n';
+    }
 
     try {
         const hbData = loadHeartbeatFile();
@@ -604,8 +606,9 @@ It defines phase contracts, dispatch pitfalls (delegation trap, context drift, p
     }
 
     try {
-        const activeSkills = loadActiveSkills();
-        const refSkills = loadSkillRegistry();
+        const orchestrationSkillIds = new Set(['dev-pabcd']);
+        const activeSkills = loadActiveSkills().filter(s => bossOrchestrationPrompt || !orchestrationSkillIds.has(s!.id));
+        const refSkills = loadSkillRegistry().filter(s => bossOrchestrationPrompt || !orchestrationSkillIds.has(s.id));
         const activeIds = new Set(activeSkills.map(s => s!.id));
         const availableRef = refSkills.filter(s => !activeIds.has(s.id));
 
@@ -672,18 +675,17 @@ It defines phase contracts, dispatch pitfalls (delegation trap, context drift, p
 
     prompt += '\n\n---\n' + getBoundedLocalSearchContract();
 
-    // ─── Delegation rules: jaw employees vs CLI sub-agents ───
-    // Always-injected guard block (survives user-edited A-1.md overrides).
-    // Employee-dispatch prose is owned by A-1 "jaw Employees vs CLI Sub-agents"
-    // + orchestration.md; only the prohibition + dispatch one-liner stay here.
-    prompt += '\n\n---\n## Delegation Rules\n';
-    prompt += '### CLI Sub-agents (Task/Agent tool)\n';
-    prompt += 'You CAN use your CLI\'s Task/Agent tools for internal subtasks: research, parallel file reads, code analysis.\n';
-    prompt += 'Subagents you spawn must NOT spawn further subagents (1-level only).\n';
-    prompt += 'When spawning a subagent, include: "Do NOT use Agent, subagent, or delegation tools. Do all work directly."\n';
-    prompt += '\n### jaw Employee Dispatch\n';
-    prompt += 'Write the task brief to a FRESH unique file per dispatch with your file tool, then `cli-jaw dispatch --agent "Name" --task-file <path> --async` — prints a runId and returns immediately. A completion notice carrying the FULL result (up to ~8k chars) re-enters your context when you are idle; if it says "clipped", read the rest via `cli-jaw worker read <runId> --tail 120`. Parallel fan-out: `--batch --agents-file <path> --async`. Omitting `--async` blocks the turn up to 10 minutes while polling — acceptable only for a quick (<2 min) read-only verify.\n';
-    prompt += 'CLI Task tool ≠ jaw employee dispatch — simple research → CLI sub-agents, never employees (full rules: "jaw Employees vs CLI Sub-agents" section).\n';
+    if (bossOrchestrationPrompt) {
+        // ─── Delegation rules: jaw employees vs CLI sub-agents ───
+        prompt += '\n\n---\n## Delegation Rules\n';
+        prompt += '### CLI Sub-agents (Task/Agent tool)\n';
+        prompt += 'You CAN use your CLI\'s Task/Agent tools for internal subtasks: research, parallel file reads, code analysis.\n';
+        prompt += 'Subagents you spawn must NOT spawn further subagents (1-level only).\n';
+        prompt += 'When spawning a subagent, include: "Do NOT use Agent, subagent, or delegation tools. Do all work directly."\n';
+        prompt += '\n### jaw Employee Dispatch\n';
+        prompt += 'Write the task brief to a FRESH unique file per dispatch with your file tool, then `cli-jaw dispatch --agent "Name" --task-file <path> --async` — prints a runId and returns immediately. A completion notice carrying the FULL result (up to ~8k chars) re-enters your context when you are idle; if it says "clipped", read the rest via `cli-jaw worker read <runId> --tail 120`. Parallel fan-out: `--batch --agents-file <path> --async`. Omitting `--async` blocks the turn up to 10 minutes while polling — acceptable only for a quick (<2 min) read-only verify.\n';
+        prompt += 'CLI Task tool ≠ jaw employee dispatch — simple research → CLI sub-agents, never employees (full rules: "jaw Employees vs CLI Sub-agents" section).\n';
+    }
 
     return prompt;
 }

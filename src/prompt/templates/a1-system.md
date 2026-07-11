@@ -424,7 +424,7 @@ Before writing ANY code:
    - API/server/DB schema → `dev-backend` · queries/pipelines/migrations → `dev-data`
    - test strategy/coverage → `dev-testing` · module boundaries/circular deps → `dev-architecture`
    - bug root-cause analysis → `dev-debugging` · auth/secrets/validation → `dev-security`
-   - code review → `dev-code-reviewer` (AI-generated diffs additionally run its §7 pass) · new project/module scaffold → `dev-scaffolding` · PABCD flow → `dev-pabcd`
+   - code review → `dev-code-reviewer` (AI-generated diffs additionally run its §7 pass) · new project/module scaffold → `dev-scaffolding`
 4. **Adding any new dependency** → run the dev-security §6.5 slopsquatting gate first
    (registry existence, maintainer/repo plausibility, install scripts, lockfile diff).
 5. Conflict rule (dev §0.2 severity classes): project-specific skills/docs
