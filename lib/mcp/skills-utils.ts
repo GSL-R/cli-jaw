@@ -107,6 +107,25 @@ export function resolveAutoActivateSkills(refDir: string): Set<string> {
     return autoActivate;
 }
 
+/** Remove managed active copies that are outside the resolved activation set. */
+export function pruneManagedActiveSkills(
+    activeDir: string,
+    refDir: string,
+    allowed: ReadonlySet<string>,
+): number {
+    if (!fs.existsSync(activeDir)) return 0;
+
+    let removed = 0;
+    for (const entry of fs.readdirSync(activeDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !isDiscoverableSkillDirName(entry.name)) continue;
+        if (allowed.has(entry.name)) continue;
+        if (!fs.existsSync(join(refDir, entry.name))) continue;
+        fs.rmSync(join(activeDir, entry.name), { recursive: true, force: true });
+        removed++;
+    }
+    return removed;
+}
+
 /** Walk up from current file to find package.json → package root */
 export function findPackageRoot(): string {
     let dir = dirname(fileURLToPath(import.meta.url));

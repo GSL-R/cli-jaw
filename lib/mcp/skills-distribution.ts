@@ -11,6 +11,7 @@ import {
     JAW_HOME,
     shouldSkipClone, writeCloneMeta, CLONE_TIMEOUT_MS,
     CODEX_ACTIVE, resolveAutoActivateSkills,
+    pruneManagedActiveSkills,
     copyDirRecursive, findPackageRoot,
     loadRegistry, getSkillVersion, shouldUpdateSkillDirectory,
     isDiscoverableSkillDirName, isSkillSourceEntryName, shouldUseLocalSkillsSource,
@@ -191,6 +192,8 @@ export function copyDefaultSkills() {
     // ─── 3. Auto-activate from refDir ───────────────
     // Uses project defaults unless the instance defines an allowlist policy.
     const AUTO_ACTIVATE = resolveAutoActivateSkills(refDir);
+    const pruned = pruneManagedActiveSkills(activeDir, refDir, AUTO_ACTIVATE);
+    if (pruned > 0) console.log(`[skills] deactivated by policy: ${pruned}`);
     let autoCount = 0;
     for (const id of AUTO_ACTIVATE) {
         const src = join(refDir, id);
@@ -272,6 +275,7 @@ export function propagateSkillsToInstances() {
 
         // 2. Sync default active skills from the instance's freshly synced ref.
         // Keep a baseActive fallback for future local-only defaults.
+        const pruned = pruneManagedActiveSkills(instActive, instRef, autoActivate);
         let activeUpdated = 0, autoActivated = 0;
         for (const id of autoActivate) {
             const refSrc = join(instRef, id);
@@ -296,6 +300,7 @@ export function propagateSkillsToInstances() {
         if (refUpdated) parts.push(`${refUpdated} updated ref`);
         if (activeUpdated) parts.push(`${activeUpdated} active updated`);
         if (autoActivated) parts.push(`${autoActivated} auto-activated`);
+        if (pruned) parts.push(`${pruned} deactivated by policy`);
         if (parts.length > 0) {
             console.log(`[skills] ${tag}: ${parts.join(', ')}`);
         }

@@ -59,6 +59,34 @@ test('per-instance allowlist overrides default and orchestration activation', ()
     }
 });
 
+test('activation policy pruning removes managed extras and preserves custom skills', () => {
+    const home = fs.mkdtempSync(join(os.tmpdir(), 'jaw-skill-prune-home-'));
+    try {
+        const active = join(home, 'skills');
+        const ref = join(home, 'skills_ref');
+        fs.mkdirSync(active, { recursive: true });
+        fs.mkdirSync(ref, { recursive: true });
+        for (const id of ['search', 'dev']) makeSkill(ref, id);
+        for (const id of ['search', 'dev', 'custom-local']) makeSkill(active, id);
+
+        const output = runNodeEval(`
+            const { pruneManagedActiveSkills } = await import('./lib/mcp/skills-utils.ts');
+            console.log(pruneManagedActiveSkills(
+                ${JSON.stringify(active)},
+                ${JSON.stringify(ref)},
+                new Set(['search']),
+            ));
+        `, { HOME: home });
+
+        assert.equal(output.trim(), '1');
+        assert.equal(fs.existsSync(join(active, 'search', 'SKILL.md')), true);
+        assert.equal(fs.existsSync(join(active, 'dev')), false);
+        assert.equal(fs.existsSync(join(active, 'custom-local', 'SKILL.md')), true);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test('propagation activates defaults from instance skills_ref and preserves custom active skills', () => {
     const home = fs.mkdtempSync(join(os.tmpdir(), 'jaw-active-defaults-home-'));
     try {
