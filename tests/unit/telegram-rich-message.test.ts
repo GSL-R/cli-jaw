@@ -43,14 +43,15 @@ function createHtmlOnlyApiSpy() {
     return { api: api as never, msgSent };
 }
 
-test('rich-capable api sends raw markdown via sendRichMessage only', async () => {
+test('newline-rich payload uses HTML to preserve Telegram layout', async () => {
     const { api, richSent, msgSent } = createRichApiSpy();
     await sendTelegramMarkdown(api, 123, '# Title\n\n**bold** and a | table |', { message_thread_id: 7 });
 
-    assert.equal(richSent.length, 1);
-    assert.equal(msgSent.length, 0);
-    assert.equal(richSent[0].rich.markdown, '# Title\n\n**bold** and a | table |');
-    assert.deepEqual(richSent[0].opts, { message_thread_id: 7 });
+    assert.equal(richSent.length, 0);
+    assert.equal(msgSent.length, 1);
+    assert.ok(msgSent[0].text.includes('\n\n'));
+    assert.ok(msgSent[0].text.includes('<b>bold</b>'));
+    assert.deepEqual(msgSent[0].opts, { parse_mode: 'HTML', message_thread_id: 7 });
 });
 
 test('rich chunk failure falls back to HTML for that chunk only', async () => {
@@ -86,7 +87,7 @@ test('api without sendRichMessage takes the HTML chain', async () => {
 test('prefix attaches to first chunk only across rich chunks', async () => {
     const { api, richSent } = createRichApiSpy();
     const para = 'x'.repeat(20000);
-    await sendTelegramMarkdown(api, 1, `${para}\n\n${para}`, { prefix: '📡 ' });
+    await sendTelegramMarkdown(api, 1, `${para}${para}`, { prefix: '📡 ' });
 
     assert.equal(richSent.length, 2);
     assert.ok(richSent[0].rich.markdown!.startsWith('📡 '));

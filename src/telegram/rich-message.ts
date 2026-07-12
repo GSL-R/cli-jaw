@@ -97,7 +97,11 @@ export async function sendTelegramMarkdown(
     opts?: RichSendOpts,
 ): Promise<void> {
     const prefix = opts?.prefix ?? '';
-    if (!supportsRichMessage(api)) {
+    // Telegram's current rich-message renderer can collapse newline-rich Korean
+    // briefings. Keep rich delivery for compact messages, but use the established
+    // HTML route whenever layout is part of the payload.
+    const requiresHtmlLayout = /\r?\n/.test(markdown);
+    if (!supportsRichMessage(api) || requiresHtmlLayout) {
         await sendHtmlFallback(api, chatId, markdown, opts, prefix);
         return;
     }
