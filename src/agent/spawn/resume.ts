@@ -84,7 +84,11 @@ export function canGuardedAgyResume(input: GuardedAgyResumeInput): { ok: boolean
     return { ok: true, reason: 'guarded-resume' };
 }
 
-/** Preserve AGY's native compacted conversation until a guarded invalidation signal. */
+/**
+ * Generic high-turn bucket resets protect CLIs whose resumed session may become
+ * stale after internal compaction. AGY persists its own compacted conversation,
+ * so preserve that bucket until an explicit guarded-resume invalidation signal.
+ */
 export function shouldClearHighTurnSessionBucket(cli: string, turns: number): boolean {
     if (turns <= 15) return false;
     return cli === 'codex' || cli === 'opencode' || cli === 'grok';

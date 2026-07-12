@@ -395,7 +395,7 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
 
     // ─── Phase 54-A: Proactive compact by turn count ───
     // CLIs without a reliable native compact/resume path get a conservative
-    // turn-count refresh. AGY owns its compaction and must keep its session.
+    // turn-count refresh. AGY owns its compaction and keeps its conversation.
     if (mainManaged && !opts.internal && code === 0 && !ctx.cliNativeCompactDetected) {
         const turns = ctx.turns ?? memoryFlushCounter;
         const useTurnCountRefresh = shouldUseTurnCountRefresh(runtimeCli);
@@ -423,9 +423,8 @@ export async function handleAgentExit(params: ExitHandlerParams): Promise<void> 
     }
 
     // ─── High-turn native-compaction coordination ───
-    // AGY keeps a native compacted conversation and can safely resume it. Only
-    // clear its bucket on an explicit stale-session signal (handled below).
-    // Other CLIs still need the conservative high-turn fresh-start guard.
+    // AGY keeps a native compacted conversation. Other CLIs still use the
+    // conservative fresh-session guard when their compaction is not observable.
     if (mainManaged && !opts.internal && code === 0 && !ctx.cliNativeCompactDetected) {
         const turns = ctx.turns ?? memoryFlushCounter;
         if (shouldClearHighTurnSessionBucket(runtimeCli, turns)) {
