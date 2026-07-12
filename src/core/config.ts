@@ -534,6 +534,7 @@ export interface HeartbeatJob {
     employee?: string;
     command?: string[];
     reportPolicy?: 'always' | 'anomaly_only' | 'silent';
+    escalateToMain?: 'user_visible';
 }
 export interface HeartbeatFile { jobs: HeartbeatJob[] }
 
@@ -569,7 +570,18 @@ function normalizeHeartbeatJob(job: HeartbeatJob): HeartbeatJob {
         console.warn(`[heartbeat:${job.name || job.id || 'unknown'}] invalid report policy; falling back to always`);
         return { ...job, runner, reportPolicy: 'always' };
     }
-    return { ...job, runner, reportPolicy };
+    const escalateToMain = job.escalateToMain;
+    if (escalateToMain !== undefined && (runner !== 'script' || escalateToMain !== 'user_visible')) {
+        console.warn(`[heartbeat:${job.name || job.id || 'unknown'}] invalid main escalation configuration; disabling escalation`);
+        const { escalateToMain: _invalidEscalation, ...withoutEscalation } = job;
+        return { ...withoutEscalation, runner, reportPolicy };
+    }
+    return {
+        ...job,
+        runner,
+        reportPolicy,
+        ...(escalateToMain === 'user_visible' ? { escalateToMain } : {}),
+    };
 }
 
 export function saveHeartbeatFile(data: HeartbeatFile | Record<string, unknown>) {

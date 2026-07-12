@@ -7,7 +7,7 @@ import { getEmployees } from '../core/db.js';
 import type { EmployeeRow } from '../core/employees.js';
 import { stripUndefined } from '../core/strip-undefined.js';
 
-type RunnerFields = Pick<import('../core/config.js').HeartbeatJob, 'runner' | 'employee' | 'command' | 'reportPolicy'>;
+type RunnerFields = Pick<import('../core/config.js').HeartbeatJob, 'runner' | 'employee' | 'command' | 'reportPolicy' | 'escalateToMain'>;
 export type HeartbeatPutRunnerResult = { ok: true; fields: RunnerFields } | { ok: false; error: string };
 
 export function normalizeHeartbeatPutRunnerFields(
@@ -22,6 +22,7 @@ export function normalizeHeartbeatPutRunnerFields(
     const employee = inherited('employee');
     const command = inherited('command');
     const reportPolicy = inherited('reportPolicy');
+    const escalateToMain = inherited('escalateToMain');
     if (runner !== undefined && runner !== 'main' && runner !== 'employee' && runner !== 'script') return { ok: false, error: 'invalid heartbeat runner' };
     if (runner === 'employee' && (typeof employee !== 'string' || !employeeNames.has(employee))) return { ok: false, error: 'unknown heartbeat employee' };
     if (runner === 'script' && (!Array.isArray(command) || command.length === 0 || !command.every(part => typeof part === 'string' && part.length > 0))) {
@@ -30,11 +31,15 @@ export function normalizeHeartbeatPutRunnerFields(
     if (reportPolicy !== undefined && reportPolicy !== null && reportPolicy !== 'always' && reportPolicy !== 'anomaly_only' && reportPolicy !== 'silent') {
         return { ok: false, error: 'invalid heartbeat report policy' };
     }
+    if (escalateToMain !== undefined && escalateToMain !== null && (runner !== 'script' || escalateToMain !== 'user_visible')) {
+        return { ok: false, error: 'invalid heartbeat main escalation' };
+    }
     return { ok: true, fields: stripUndefined({
         runner: runner ?? undefined,
         employee: employee == null ? undefined : employee as string,
         command: command == null ? undefined : command as string[],
         reportPolicy: reportPolicy == null ? undefined : reportPolicy as RunnerFields['reportPolicy'],
+        escalateToMain: escalateToMain == null ? undefined : escalateToMain as RunnerFields['escalateToMain'],
     }) };
 }
 

@@ -52,10 +52,20 @@ test('heartbeat schema defaults remain main/always and invalid runner fails soft
 });
 
 test('manager-shaped PUT preserves runner fields by existing job id', () => {
-    const existing = { runner: 'script' as const, command: [process.execPath, '-e', "console.log('ok')"], reportPolicy: 'anomaly_only' as const };
+    const existing = {
+        runner: 'script' as const,
+        command: [process.execPath, '-e', "console.log('ok')"],
+        reportPolicy: 'anomaly_only' as const,
+        escalateToMain: 'user_visible' as const,
+    };
     const strippedManagerJob = { id: 'script-job', name: 'script', enabled: true, schedule: { minutes: 5 }, prompt: 'check' };
     const result = normalizeHeartbeatPutRunnerFields(strippedManagerJob, existing, new Set());
     assert.deepEqual(result, { ok: true, fields: existing });
+});
+
+test('PUT normalization rejects main escalation for a non-script runner', () => {
+    const result = normalizeHeartbeatPutRunnerFields({ runner: 'main', escalateToMain: 'user_visible' }, undefined, new Set());
+    assert.deepEqual(result, { ok: false, error: 'invalid heartbeat main escalation' });
 });
 
 test('PUT normalization rejects an unknown employee', () => {

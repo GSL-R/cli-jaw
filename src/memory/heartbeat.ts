@@ -171,6 +171,20 @@ export function runHeartbeatScript(command: string[]): Promise<HeartbeatReport> 
     });
 }
 
+function buildScriptEscalationPrompt(prompt: string, report: HeartbeatReport): string {
+    const evidence = report.raw.slice(0, 12 * 1024);
+    return [
+        prompt,
+        '',
+        '--- Script runner result ---',
+        'The scheduled script has already completed. Do not run it again.',
+        'Use only the facts in its structured event output and relevant recent conversation context.',
+        'Write one natural user-facing response. Do not expose event IDs, raw JSON, internal paths, or commands.',
+        evidence,
+        '--- End script runner result ---',
+    ].join('\n');
+}
+
 async function runEmployee(job: Record<string, any>, prompt: string): Promise<HeartbeatReport> {
     const emp = (getEmployees.all() as EmployeeRow[]).find(row => row.name === job["employee"]);
     if (!emp) return parseHeartbeatReport('status: failed\nsummary: employee not found');
@@ -228,13 +242,32 @@ export async function runHeartbeatJob(job: Record<string, any>) {
         const prompt = `[heartbeat:${job["name"]}] 현재 시간: ${now} (${timeZone})\n\nHeartbeat task rule: run the job's explicit script or narrow task first. Do not perform startup self-audit, provider config inspection, broad file search, or memory search unless the job itself needs historical context and no canonical tool/path is available.${goalSection}\n\n${job["prompt"] || '정기 점검입니다. 할 일 없으면 [SILENT]로 응답.'}`;
         log.info(`[heartbeat:${job["name"]}] tick (${describeHeartbeatSchedule(schedule)})`);
         let rawResult: string;
+        let scriptEscalated = false;
+        let scriptQuiet = false;
         if (runner === 'employee') {
             rawResult = (await runEmployee(job, prompt)).raw;
         } else if (runner === 'script') {
             const scriptReport = await runHeartbeatScript(job["command"] || []);
-            rawResult = scriptReport.status === 'failed' && !/^status:/m.test(scriptReport.raw)
-                ? `${scriptReport.raw}\nstatus: failed\nsummary: ${scriptReport.summary || 'script failed'}`
-                : scriptReport.raw;
+            if (job["escalateToMain"] === 'user_visible' && scriptReport.status === 'ok' && scriptReport.userVisible) {
+                if (isAgentBusy()) {
+                    const fallbackSent = await sendHeartbeatEventFallback(job, eventWindowStart, 'main agent busy during script escalation');
+                    if (fallbackSent) return;
+                    rawResult = `${scriptReport.raw}\nstatus: warning\nuser_visible: true\nsummary: ${scriptReport.summary || 'script event ready while main agent busy'}`;
+                } else {
+                    scriptEscalated = true;
+                    const escalationPrompt = buildScriptEscalationPrompt(prompt, scriptReport);
+                    const first = await orchestrateAndCollectData(escalationPrompt, { origin: 'heartbeat', requestId: crypto.randomUUID() });
+                    const collected = first.data.agyPlannerOnly === true
+                        ? await orchestrateAndCollectData(escalationPrompt, { origin: 'heartbeat', requestId: crypto.randomUUID() })
+                        : first;
+                    rawResult = String(collected.text);
+                }
+            } else {
+                scriptQuiet = job["escalateToMain"] === 'user_visible' && scriptReport.status === 'ok';
+                rawResult = scriptReport.status === 'failed' && !/^status:/m.test(scriptReport.raw)
+                    ? `${scriptReport.raw}\nstatus: failed\nsummary: ${scriptReport.summary || 'script failed'}`
+                    : scriptReport.raw;
+            }
         } else {
             const first = await orchestrateAndCollectData(prompt, { origin: 'heartbeat', requestId: crypto.randomUUID() });
             const collected = first.data.agyPlannerOnly === true
@@ -255,7 +288,7 @@ export async function runHeartbeatJob(job: Record<string, any>) {
 
         const report = parseHeartbeatReport(result);
         if (report.recordRequired) setRecordPending(report.evidence || report.summary || result);
-        const policy = job["reportPolicy"] || 'always';
+        const policy = scriptEscalated ? 'always' : scriptQuiet ? 'silent' : job["reportPolicy"] || 'always';
         const decision = decideHeartbeatReport(report, policy);
         const deliveryText = report.summary || result;
         const formatted = report.status === 'ok' ? deliveryText : `[${report.status}] ${deliveryText}`;

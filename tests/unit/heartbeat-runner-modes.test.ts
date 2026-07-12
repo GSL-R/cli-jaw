@@ -1,5 +1,7 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const collectUrl = new URL('../../src/orchestrator/collect.ts', import.meta.url).href;
 const sendUrl = new URL('../../src/messaging/send.ts', import.meta.url).href;
@@ -17,6 +19,7 @@ const [realSend, realDb, realState, realSpawn, realRegistry, realDistribute] = a
 let collectCalls = 0;
 let plannerOnly = false;
 let employeeBusy = false;
+let agentBusy = false;
 const sent: string[] = [];
 const anchors: unknown[][] = [];
 const employee = { id: 'emp-1', name: 'reviewer', cli: 'codex', model: null, role: 'reviewer' };
@@ -35,7 +38,7 @@ mock.module(dbUrl, { namedExports: {
     insertHeartbeatAnchor: { run: (...args: unknown[]) => { anchors.push(args); } },
 } });
 mock.module(stateUrl, { namedExports: { ...realState, getState: () => 'IDLE' } });
-mock.module(spawnUrl, { namedExports: { ...realSpawn, isAgentBusy: () => false, messageQueue: [] } });
+mock.module(spawnUrl, { namedExports: { ...realSpawn, isAgentBusy: () => agentBusy, messageQueue: [] } });
 mock.module(registryUrl, { namedExports: {
     ...realRegistry,
     claimWorker: () => {
@@ -96,6 +99,68 @@ test('script runner parses real exit-0 contract output', async () => {
 test('script runner maps a real nonzero exit to failed', async () => {
     const result = await runHeartbeatScript([process.execPath, '-e', "console.error('boom'); process.exit(3)"]);
     assert.equal(result.status, 'failed');
+});
+
+test('script runner escalates a user-visible result to main exactly once', async () => {
+    collectCalls = 0; plannerOnly = false; sent.length = 0;
+    await runHeartbeatJob({
+        id: 'script-escalate',
+        name: 'script escalate',
+        runner: 'script',
+        command: [process.execPath, '-e', "console.log('[EVENT] fact\\nstatus: ok\\nuser_visible: true\\nsummary: event ready')"],
+        reportPolicy: 'anomaly_only',
+        escalateToMain: 'user_visible',
+        schedule: { minutes: 5 },
+        prompt: 'format event',
+    });
+    assert.equal(collectCalls, 1);
+    assert.deepEqual(sent, ['main complete']);
+});
+
+test('script runner keeps a non-visible successful result quiet without calling main', async () => {
+    collectCalls = 0; plannerOnly = false; sent.length = 0;
+    await runHeartbeatJob({
+        id: 'script-quiet',
+        name: 'script quiet',
+        runner: 'script',
+        command: [process.execPath, '-e', "console.log('status: ok\\nuser_visible: false\\nsummary: stable')"],
+        reportPolicy: 'anomaly_only',
+        escalateToMain: 'user_visible',
+        schedule: { minutes: 5 },
+        prompt: 'format event',
+    });
+    assert.equal(collectCalls, 0);
+    assert.equal(sent.length, 0);
+});
+
+test('script escalation uses event fallback instead of overlapping a busy main agent', async () => {
+    collectCalls = 0; plannerOnly = false; sent.length = 0; agentBusy = true;
+    const eventQueuePath = path.join(process.env.CLI_JAW_HOME!, 'deep-work-events.json');
+    const timestamp = Date.now() + 1_000;
+    fs.writeFileSync(eventQueuePath, JSON.stringify({
+        version: 1,
+        events: [{
+            id: 'event-1', createdAt: timestamp, updatedAt: timestamp, status: 'pending',
+            eventType: 'study_nudge', severity: 'advisory', facts: {}, fallbackText: 'safe fallback',
+        }],
+    }));
+    try {
+        await runHeartbeatJob({
+            id: 'script-busy-escalate',
+            name: 'script busy escalate',
+            runner: 'script',
+            command: [process.execPath, '-e', "console.log('status: ok\\nuser_visible: true\\nsummary: event ready')"],
+            reportPolicy: 'anomaly_only',
+            escalateToMain: 'user_visible',
+            eventQueuePath,
+            schedule: { minutes: 5 },
+            prompt: 'format event',
+        });
+    } finally {
+        agentBusy = false;
+    }
+    assert.equal(collectCalls, 0);
+    assert.deepEqual(sent, ['safe fallback']);
 });
 
 // Timeout configuration remains a source-contract assertion: waiting ten real minutes is not an acceptable unit test.
